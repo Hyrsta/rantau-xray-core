@@ -1,4 +1,3 @@
-diff -ru a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 --- a/app/proxyman/outbound/handler.go
 +++ b/app/proxyman/outbound/handler.go
 @@ -6,7 +6,6 @@
@@ -9,21 +8,20 @@ diff -ru a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  
  	"github.com/xtls/xray-core/common/dice"
  
-@@ -307,10 +306,6 @@
- 			h.SetOutboundGateway(ctx, ob)
- 		}
+@@ -309,10 +308,6 @@
  
--	}
--
--	if conn, err := h.getUoTConnection(ctx, dest); err != os.ErrInvalid {
--		return conn, err
  	}
  
+-	if conn, err := h.getUoTConnection(ctx, dest); err != os.ErrInvalid {
+-		return conn, err
+-	}
+-
  	conn, err := internet.Dial(ctx, dest, h.streamSettings)
-diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
+ 	conn = h.getStatCouterConnection(conn)
+ 	outbounds := session.OutboundsFromContext(ctx)
 --- a/infra/conf/shadowsocks.go
 +++ b/infra/conf/shadowsocks.go
-@@ -1,18 +1,26 @@
+@@ -1,17 +1,25 @@
  package conf
  
  import (
@@ -39,7 +37,7 @@ diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
 -	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
  	"google.golang.org/protobuf/proto"
  )
- 
++
 +// Shadowsocks 2022 methods. This build leaves Shadowsocks 2022 out.
 +var shadowsocks2022Methods = []string{"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"}
 +
@@ -49,10 +47,9 @@ diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
 +	}
 +	return nil
 +}
-+
+ 
  func cipherFromString(c string) shadowsocks.CipherType {
  	switch strings.ToLower(c) {
- 	case "aes-128-gcm", "aead_aes_128_gcm":
 @@ -51,8 +59,8 @@
  func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
  	errors.PrintNonRemovalDeprecatedFeatureWarning("Shadowsocks (with no Forward Secrecy, etc.)", "VLESS Encryption")
@@ -64,10 +61,13 @@ diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
  	}
  
  	config := new(shadowsocks.ServerConfig)
-@@ -98,66 +106,6 @@
- 	return config, nil
- }
+@@ -95,66 +103,6 @@
+ 		})
+ 	}
  
+-	return config, nil
+-}
+-
 -func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
 -	if len(v.Users) == 0 {
 -		config := new(shadowsocks_2022.ServerConfig)
@@ -125,12 +125,9 @@ diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
 -			Port:    uint32(user.Port),
 -		})
 -	}
--	return config, nil
--}
--
- type ShadowsocksServerTarget struct {
- 	Address    *Address `json:"address"`
- 	Port       uint16   `json:"port"`
+ 	return config, nil
+ }
+ 
 @@ -202,34 +150,10 @@
  		return nil, errors.New(`Shadowsocks settings: "servers" should have one and only one member. Multiple endpoints in "servers" should use multiple Shadowsocks outbounds and routing balancer instead`)
  	}
@@ -168,7 +165,6 @@ diff -ru a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
  		}
  		if server.Address == nil {
  			return nil, errors.New("Shadowsocks server address is not set.")
-diff -ru a/main/commands/all/api/inbound_user_add.go b/main/commands/all/api/inbound_user_add.go
 --- a/main/commands/all/api/inbound_user_add.go
 +++ b/main/commands/all/api/inbound_user_add.go
 @@ -13,7 +13,6 @@
@@ -179,16 +175,15 @@ diff -ru a/main/commands/all/api/inbound_user_add.go b/main/commands/all/api/inb
  	"github.com/xtls/xray-core/proxy/trojan"
  	vlessin "github.com/xtls/xray-core/proxy/vless/inbound"
  	vmessin "github.com/xtls/xray-core/proxy/vmess/inbound"
-@@ -84,8 +83,6 @@
- 	case *trojan.ServerConfig:
+@@ -85,8 +84,6 @@
  		return ty.Users
  	case *shadowsocks.ServerConfig:
--		return ty.Users
--	case *shadowsocks_2022.MultiUserServerConfig:
  		return ty.Users
+-	case *shadowsocks_2022.MultiUserServerConfig:
+-		return ty.Users
  	default:
  		fmt.Println("unsupported inbound type")
-diff -ru a/proxy/wireguard/tun_linux.go b/proxy/wireguard/tun_linux.go
+ 	}
 --- a/proxy/wireguard/tun_linux.go
 +++ b/proxy/wireguard/tun_linux.go
 @@ -10,10 +10,10 @@
@@ -221,7 +216,6 @@ diff -ru a/proxy/wireguard/tun_linux.go b/proxy/wireguard/tun_linux.go
  	return &deviceNet{dialer: dialer}
  }
  
-diff -ru a/transport/internet/system_dialer.go b/transport/internet/system_dialer.go
 --- a/transport/internet/system_dialer.go
 +++ b/transport/internet/system_dialer.go
 @@ -5,7 +5,6 @@
@@ -253,7 +247,6 @@ diff -ru a/transport/internet/system_dialer.go b/transport/internet/system_diale
  	if ctl == nil {
  		return errors.New("nil listener controller")
  	}
-diff -ru a/transport/internet/system_listener.go b/transport/internet/system_listener.go
 --- a/transport/internet/system_listener.go
 +++ b/transport/internet/system_listener.go
 @@ -10,7 +10,6 @@
@@ -286,7 +279,6 @@ diff -ru a/transport/internet/system_listener.go b/transport/internet/system_lis
  	if controller == nil {
  		return errors.New("nil listener controller")
  	}
-diff -ru a/transport/internet/system_listener_test.go b/transport/internet/system_listener_test.go
 --- a/transport/internet/system_listener_test.go
 +++ b/transport/internet/system_listener_test.go
 @@ -6,7 +6,6 @@
@@ -308,3 +300,879 @@ diff -ru a/transport/internet/system_listener_test.go b/transport/internet/syste
  		})
  	}))
  
+--- a/common/session/context.go
++++ b/common/session/context.go
+@@ -192,3 +192,29 @@
+ 	}
+ 	return ""
+ }
++
++// udpRejectKey carries a TUN-only local refusal callback. Outbounds call it only
++// for explicit unsupported UDP requests, never for generic network failures.
++type udpRejectKey struct{}
++
++func ContextWithUDPReject(ctx context.Context, reject func()) context.Context {
++	return context.WithValue(ctx, udpRejectKey{}, reject)
++}
++
++func RejectUDP(ctx context.Context) {
++	if reject, ok := ctx.Value(udpRejectKey{}).(func()); ok {
++		reject()
++	}
++}
++
++// preconnectKey marks speculative reserve dials, never user-requested traffic.
++// A failed reserve must not spawn detached camouflage requests outside its budget.
++type preconnectKey struct{}
++
++func ContextWithPreconnect(ctx context.Context) context.Context {
++	return context.WithValue(ctx, preconnectKey{}, true)
++}
++func IsPreconnect(ctx context.Context) bool {
++	value, _ := ctx.Value(preconnectKey{}).(bool)
++	return value
++}
+--- a/proxy/tun/handler.go
++++ b/proxy/tun/handler.go
+@@ -109,6 +109,9 @@
+ 	ctx, cancel := context.WithCancel(t.ctx)
+ 	defer cancel()
+ 	ctx = c.ContextWithID(ctx, session.NewID())
++	if udp, ok := conn.(interface{ RejectUDP() }); ok {
++		ctx = session.ContextWithUDPReject(ctx, udp.RejectUDP)
++	}
+ 
+ 	source := net.DestinationFromAddr(conn.RemoteAddr())
+ 	inbound := session.Inbound{
+--- a/proxy/tun/stack_gvisor.go
++++ b/proxy/tun/stack_gvisor.go
+@@ -115,7 +115,15 @@
+ 		src := net.UDPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort))
+ 		dst := net.UDPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort))
+ 
+-		return udpForwarder.HandlePacket(src, dst, data)
++		// Retain only headers for a possible ICMP error, never application data.
++		// Copies are needed because gVisor releases pkt after this handler returns.
++		var reject func() error
++		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber && dst.Port == 443 {
++			quote := append([]byte(nil), pkt.NetworkHeader().Slice()...)
++			quote = append(quote, pkt.TransportHeader().Slice()[:header.UDPMinimumSize]...)
++			reject = func() error { return t.writeUDPPortUnreachable(quote, src, dst) }
++		}
++		return udpForwarder.HandlePacket(src, dst, data, reject)
+ 	})
+ 
+ 	t.stack = ipStack
+@@ -262,3 +270,22 @@
+ 
+ 	return gStack, nil
+ }
++
++// writeUDPPortUnreachable answers an explicitly refused IPv4 datagram. Quoting
++// the original IP header and UDP header is sufficient for Android to match the
++// socket; the payload is neither retained nor included in the response.
++func (t *stackGVisor) writeUDPPortUnreachable(quote []byte, src, dst net.Destination) error {
++	raw := make([]byte, header.IPv4MinimumSize+header.ICMPv4MinimumSize+len(quote))
++	ip := header.IPv4(raw)
++	ip.Encode(&header.IPv4Fields{TotalLength: uint16(len(raw)), TTL: 64, Protocol: uint8(header.ICMPv4ProtocolNumber), SrcAddr: tcpip.AddrFromSlice(dst.Address.IP()), DstAddr: tcpip.AddrFromSlice(src.Address.IP())})
++	ip.SetChecksum(^ip.CalculateChecksum())
++	icmp := header.ICMPv4(raw[header.IPv4MinimumSize:])
++	icmp.SetType(header.ICMPv4DstUnreachable)
++	icmp.SetCode(header.ICMPv4PortUnreachable)
++	copy(icmp[header.ICMPv4MinimumSize:], quote)
++	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
++	if err := t.stack.WriteRawPacket(defaultNIC, header.IPv4ProtocolNumber, buffer.MakeWithData(raw)); err != nil {
++		return errors.New("failed to write local UDP refusal", err)
++	}
++	return nil
++}
+--- a/proxy/tun/udp_fullcone.go
++++ b/proxy/tun/udp_fullcone.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"io"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/net"
+@@ -30,31 +31,37 @@
+ 
+ // HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
+ // this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
+-func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte) bool {
++func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte, reject func() error) bool {
+ 	u.Lock()
+ 	conn, found := u.udpConns[src]
+ 	if !found {
+ 		egress := make(chan []byte, 16)
+-		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
++		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst, reject: reject}
++		if dst.Port == 443 && dst.Address.Family().IsIPv4() {
++			udp443Attempts.Add(1)
++		}
+ 		u.udpConns[src] = conn
+ 
+ 		go u.handleConnection(conn, dst)
+ 	}
+-	u.Unlock()
+ 
++	// Keep channel send and close under the same lock; early rejection can race
++	// the very first datagram.
+ 	// send packet data to the egress channel, if it has buffer, or discard
+ 	select {
+ 	case conn.egress <- data:
+ 	default:
+ 	}
+ 
++	u.Unlock()
+ 	return true
+ }
+ 
+-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
++func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
++	src := c.src
+ 	u.Lock()
+ 	conn, found := u.udpConns[src]
+-	if found {
++	if found && conn == c {
+ 		delete(u.udpConns, src)
+ 		close(conn.egress)
+ 	}
+@@ -68,9 +75,11 @@
+ 
+ 	handler *udpConnectionHandler
+ 
+-	egress chan []byte
+-	src    net.Destination
+-	dst    net.Destination
++	egress     chan []byte
++	src        net.Destination
++	dst        net.Destination
++	reject     func() error
++	rejectOnce sync.Once
+ }
+ 
+ // Read packets from the connection
+@@ -96,7 +105,7 @@
+ }
+ 
+ func (c *udpConn) Close() error {
+-	c.handler.connectionFinished(c.src)
++	c.handler.connectionFinished(c)
+ 
+ 	return nil
+ }
+@@ -132,3 +141,20 @@
+ 
+ 	return nil
+ }
++
++var udp443Attempts, rejectedUDP443 atomic.Int64
++
++// UDP443Attempts counts new IPv4 UDP/443 TUN associations for this process.
++// Full-cone associations are keyed by source address/port, not individual packets.
++func UDP443Attempts() int64 { return udp443Attempts.Load() }
++
++// RejectedUDP443 counts successfully emitted local IPv4 port-unreachable replies.
++func RejectedUDP443() int64 { return rejectedUDP443.Load() }
++
++func (c *udpConn) RejectUDP() {
++	c.rejectOnce.Do(func() {
++		if c.reject != nil && c.reject() == nil && c.dst.Port == 443 && c.dst.Address.Family().IsIPv4() {
++			rejectedUDP443.Add(1)
++		}
++	})
++}
+--- a/proxy/vless/outbound/outbound.go
++++ b/proxy/vless/outbound/outbound.go
+@@ -16,7 +16,6 @@
+ 	"github.com/xtls/xray-core/app/reverse"
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+-	xctx "github.com/xtls/xray-core/common/ctx"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/mux"
+ 	"github.com/xtls/xray-core/common/net"
+@@ -55,14 +54,10 @@
+ 	encryption    *encryption.ClientInstance
+ 	reverse       *Reverse
+ 
+-	testpre  uint32
+-	initpre  sync.Once
+-	preConns chan *ConnExpire
+-}
+-
+-type ConnExpire struct {
+-	Conn   stat.Connection
+-	Expire time.Time
++	testpre   uint32
++	preMu     sync.Mutex
++	prePool   *preconnectPool
++	preClosed bool
+ }
+ 
+ // New creates a new VLess outbound handler.
+@@ -135,8 +130,12 @@
+ 
+ // Close implements common.Closable.Close().
+ func (h *Handler) Close() error {
+-	if h.preConns != nil {
+-		close(h.preConns)
++	h.preMu.Lock()
++	h.preClosed = true
++	pool := h.prePool
++	h.preMu.Unlock()
++	if pool != nil {
++		pool.Close()
+ 	}
+ 	if h.reverse != nil {
+ 		return h.reverse.Close()
+@@ -154,38 +153,18 @@
+ 	ob.Name = "vless"
+ 
+ 	rec := h.server
++	// Vision cannot carry UDP/443 unless the client explicitly enables -udp443.
++	// Refuse after the real router has selected VLESS but before dialing/TLS, and
++	// let packet-based inbounds report the unsupported port to their application.
++	if ob.Target.Network == net.Network_UDP && ob.Target.Port == 443 && rec.User.Account.(*vless.MemoryAccount).Flow == vless.XRV && !isMuxTarget(ob.Target) {
++		session.RejectUDP(ctx)
++		return errors.New("XTLS rejected UDP/443 traffic").AtInfo()
++	}
+ 	var conn stat.Connection
+ 
+ 	if h.testpre > 0 && h.reverse == nil {
+-		h.initpre.Do(func() {
+-			h.preConns = make(chan *ConnExpire)
+-			for range h.testpre { // TODO: randomize
+-				go func() {
+-					defer func() { recover() }()
+-					ctx := xctx.ContextWithID(context.Background(), session.NewID())
+-					for {
+-						conn, err := dialer.Dial(ctx, rec.Destination)
+-						if err != nil {
+-							errors.LogWarningInner(ctx, err, "pre-connect failed")
+-							continue
+-						}
+-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
+-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
+-					}
+-				}()
+-			}
+-		})
+-		for {
+-			connTime := <-h.preConns
+-			if connTime == nil {
+-				return errors.New("closed handler").AtWarning()
+-			}
+-			if time.Now().Before(connTime.Expire) {
+-				conn = connTime.Conn
+-				break
+-			}
+-			connTime.Conn.Close()
+-		}
++		// A spare is optional: never queue a real request behind background dialing.
++		conn = h.takePreconnect(ctx, dialer)
+ 	}
+ 
+ 	if conn == nil {
+@@ -487,3 +466,8 @@
+ func (r *Reverse) Close() error {
+ 	return r.monitorTask.Close()
+ }
++
++// Special domain destinations use a different VLESS command, not UDP.
++func isMuxTarget(target net.Destination) bool {
++	return target.Address.Family().IsDomain() && (target.Address.Domain() == "v1.mux.cool" || target.Address.Domain() == "v1.rvs.cool")
++}
+--- /dev/null
++++ b/proxy/tun/udp_fullcone_test.go
+@@ -0,0 +1,74 @@
++package tun
++
++import (
++	"bytes"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++)
++
++func TestUDPDirectTrafficStillReturnsData(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40000)
++	dst := net.UDPDestination(net.ParseAddress("192.168.1.1"), 443)
++	replied := make(chan []byte, 1)
++	refused := false
++	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
++		defer c.Close()
++		b := make([]byte, 64)
++		n, err := c.Read(b)
++		if err == nil {
++			c.Write(b[:n])
++		}
++	}, func(b []byte, from, to net.Destination) error {
++		if from != dst || to != src {
++			t.Error("return direction changed")
++		}
++		replied <- append([]byte(nil), b...)
++		return nil
++	})
++	h.HandlePacket(src, dst, []byte("direct QUIC"), func() error { refused = true; return nil })
++	select {
++	case b := <-replied:
++		if !bytes.Equal(b, []byte("direct QUIC")) {
++			t.Fatal("payload changed")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("no UDP reply")
++	}
++	if refused {
++		t.Fatal("direct traffic refused")
++	}
++}
++
++func TestUDPEarlyRefusalDoesNotRacePacketSendOrReplacement(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40001)
++	dst := net.UDPDestination(net.ParseAddress("198.51.100.1"), 443)
++	var done sync.WaitGroup
++	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
++		c.(*udpConn).RejectUDP()
++		c.Close()
++		_, err := c.Read(make([]byte, 32))
++		if err != nil && err != io.EOF {
++			t.Error(err)
++		}
++		done.Done()
++	}, nil)
++	// Each creation adds once under the same handler lock as creation; reject callback
++	// can immediately close while the producer is enqueueing the first datagram.
++	for i := 0; i < 100; i++ {
++		done.Add(1)
++		h.HandlePacket(src, dst, []byte("x"), func() error { return nil })
++		done.Wait()
++	}
++	old := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
++	current := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
++	h.udpConns[src] = current
++	old.Close()
++	if h.udpConns[src] != current {
++		t.Fatal("stale close deleted replacement")
++	}
++	current.Close()
++}
+--- /dev/null
++++ b/proxy/vless/outbound/udp_refuse_test.go
+@@ -0,0 +1,60 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++// Stop at the dial boundary without network access or waiting through retries.
++type dialBoundary struct{}
++
++func (dialBoundary) Dial(context.Context, net.Destination) (stat.Connection, error) {
++	panic(dialBoundary{})
++}
++func (dialBoundary) DestIpAddress() net.IP                                 { return nil }
++func (dialBoundary) SetOutboundGateway(context.Context, *session.Outbound) {}
++
++func TestUDPRefusalOnlyForUnsupportedVisionUDP443(t *testing.T) {
++	for _, c := range []struct {
++		name, flow string
++		target     net.Destination
++		reject     bool
++	}{
++		{"vision443", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), true},
++		{"visionDomain443", vless.XRV, net.UDPDestination(net.DomainAddress("instagram.com"), 443), true},
++		{"enabled443", vless.XRV + "-udp443", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"plain443", "", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"dns", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 53), false},
++		{"tcp", vless.XRV, net.TCPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"mux", vless.XRV, net.UDPDestination(net.DomainAddress("v1.mux.cool"), 443), false},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			h := &Handler{server: &protocol.ServerSpec{User: &protocol.MemoryUser{Account: &vless.MemoryAccount{Flow: c.flow}}}}
++			ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: c.target}})
++			refused := false
++			ctx = session.ContextWithUDPReject(ctx, func() { refused = true })
++			dialed := false
++			func() {
++				defer func() {
++					if p := recover(); p != nil {
++						if _, ok := p.(dialBoundary); !ok {
++							panic(p)
++						}
++						dialed = true
++					}
++				}()
++				h.Process(ctx, &transport.Link{}, dialBoundary{})
++			}()
++			if refused != c.reject || dialed == c.reject {
++				t.Fatalf("refused=%v dialed=%v, want refusal=%v", refused, dialed, c.reject)
++			}
++		})
++	}
++}
+--- /dev/null
++++ b/proxy/vless/outbound/preconnect.go
+@@ -0,0 +1,203 @@
++package outbound
++
++import (
++	"context"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	xctx "github.com/xtls/xray-core/common/ctx"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++// A demand-driven reserve, never a connection multiplexer. At most two extra
++// connections can be dialing/idle. Idle expiry never replenishes the reserve.
++// Two seconds is deliberately below even the historical four-second server
++// VLESS-header timeout. No application payload is sent until a caller takes it.
++const (
++	preconnectMax         = 2
++	preconnectTTL         = 2 * time.Second
++	preconnectDialTimeout = 3 * time.Second
++	preconnectBackoff     = 250 * time.Millisecond
++)
++
++var preconnectHits, preconnectMisses, preconnectDials atomic.Int64
++
++// Aggregate process-lifetime counters, without browsing destinations or payloads.
++func PreconnectHits() int64   { return preconnectHits.Load() }
++func PreconnectMisses() int64 { return preconnectMisses.Load() }
++func PreconnectDials() int64  { return preconnectDials.Load() }
++
++type preconnectSpare struct {
++	conn    stat.Connection
++	expires time.Time
++	timer   *time.Timer
++}
++
++type preconnectPool struct {
++	mu               sync.Mutex
++	ctx              context.Context
++	cancel           context.CancelFunc
++	dial             func(context.Context) (stat.Connection, error)
++	limit            int
++	ttl, dialTimeout time.Duration
++	ready            []*preconnectSpare
++	inFlight         int
++	failures         uint
++	nextTry          time.Time
++	closed           bool
++	wg               sync.WaitGroup
++}
++
++func newPreconnectPool(limit int, dial func(context.Context) (stat.Connection, error)) *preconnectPool {
++	if limit > preconnectMax {
++		limit = preconnectMax
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	return &preconnectPool{ctx: ctx, cancel: cancel, dial: dial, limit: limit, ttl: preconnectTTL, dialTimeout: preconnectDialTimeout}
++}
++
++// Take returns immediately when the reserve is empty; callers use their normal
++// request-context dial. Only demand calls can create work, with a bounded retry
++// cooldown after errors. Timer callbacks only discard stale idle connections.
++func (p *preconnectPool) Take() stat.Connection {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.closed {
++		return nil
++	}
++	now := time.Now()
++	var conn stat.Connection
++	for len(p.ready) > 0 {
++		spare := p.ready[0]
++		p.ready = p.ready[1:]
++		spare.timer.Stop()
++		if now.Before(spare.expires) {
++			conn = spare.conn
++			break
++		}
++		discardPreconnect(spare.conn)
++	}
++	if !now.Before(p.nextTry) {
++		for len(p.ready)+p.inFlight < p.limit {
++			p.inFlight++
++			p.wg.Add(1)
++			go p.fill()
++		}
++	}
++	if conn != nil {
++		preconnectHits.Add(1)
++	} else {
++		preconnectMisses.Add(1)
++	}
++	return conn
++}
++
++func (p *preconnectPool) fill() {
++	defer p.wg.Done()
++	ctx, cancel := context.WithTimeout(p.ctx, p.dialTimeout)
++	preconnectDials.Add(1)
++	conn, err := p.dial(ctx)
++	cancel()
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.inFlight--
++	if err != nil || p.closed {
++		if conn != nil {
++			discardPreconnect(conn)
++		}
++		if err != nil && !p.closed {
++			if p.failures < 5 {
++				p.failures++
++			}
++			p.nextTry = time.Now().Add(preconnectBackoff * time.Duration(1<<(p.failures-1)))
++		}
++		return
++	}
++	p.failures = 0
++	p.nextTry = time.Time{}
++	spare := &preconnectSpare{conn: conn, expires: time.Now().Add(p.ttl)}
++	p.ready = append(p.ready, spare)
++	spare.timer = time.AfterFunc(p.ttl, func() { p.expire(spare) })
++}
++
++func (p *preconnectPool) expire(spare *preconnectSpare) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for i, s := range p.ready {
++		if s == spare {
++			p.ready = append(p.ready[:i], p.ready[i+1:]...)
++			discardPreconnect(s.conn)
++			return
++		}
++	}
++}
++
++// A reserve has never carried application data. Close the raw TLS transport
++// directly: TLS close_notify may block for five seconds and must not stall the
++// pool lock or a request falling back to its normal dial.
++func discardPreconnect(conn stat.Connection) {
++	conn = stat.TryUnwrapStatsConn(conn)
++	if conn == nil {
++		return
++	}
++	if tlsConn, ok := conn.(interface{ NetConn() net.Conn }); ok {
++		conn = tlsConn.NetConn()
++	}
++	conn.Close()
++}
++
++func (p *preconnectPool) Close() {
++	p.mu.Lock()
++	p.closed = true
++	p.cancel()
++	for _, spare := range p.ready {
++		spare.timer.Stop()
++		discardPreconnect(spare.conn)
++	}
++	p.ready = nil
++	p.mu.Unlock()
++	// No worker can be added after closed is set under mu. Real TCP/REALITY
++	// dialing honors this cancellation; wait for owned sockets to be released.
++	p.wg.Wait()
++}
++
++func (h *Handler) takePreconnect(ctx context.Context, dialer internet.Dialer) stat.Connection {
++	h.preMu.Lock()
++	if h.preClosed {
++		h.preMu.Unlock()
++		return nil
++	}
++	if h.prePool == nil {
++		// The pool owns its lifetime. Preserve gateway/source routing values in a
++		// private session, never mutable per-request Outbound pointers or cancellation.
++		outbounds := session.OutboundsFromContext(ctx)
++		var template session.Outbound
++		if len(outbounds) > 0 {
++			template.Gateway = outbounds[len(outbounds)-1].Gateway
++		}
++		template.Name = "vless"
++		template.Target = h.server.Destination
++		var inbound *session.Inbound
++		if in := session.InboundFromContext(ctx); in != nil {
++			inbound = &session.Inbound{Source: in.Source, Local: in.Local}
++		}
++		h.prePool = newPreconnectPool(int(h.testpre), func(ctx context.Context) (stat.Connection, error) {
++			ob := template
++			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{&ob})
++			if inbound != nil {
++				copy := *inbound
++				ctx = session.ContextWithInbound(ctx, &copy)
++			}
++			ctx = xctx.ContextWithID(ctx, session.NewID())
++			ctx = session.ContextWithPreconnect(ctx)
++			return dialer.Dial(ctx, h.server.Destination)
++		})
++	}
++	pool := h.prePool
++	h.preMu.Unlock()
++	return pool.Take()
++}
+--- /dev/null
++++ b/proxy/vless/outbound/preconnect_test.go
+@@ -0,0 +1,160 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"github.com/xtls/xray-core/transport/internet/stat"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type trackedConn struct {
++	net.Conn
++	closed atomic.Int32
++}
++
++func (c *trackedConn) Close() error { c.closed.Add(1); return nil }
++func eventually(t *testing.T, f func() bool) {
++	t.Helper()
++	end := time.Now().Add(time.Second)
++	for time.Now().Before(end) {
++		if f() {
++			return
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Fatal("condition did not become true")
++}
++func readyCount(p *preconnectPool) int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.ready) }
++
++func TestPreconnectEmptyNeverWaitsAndCapsExtraDials(t *testing.T) {
++	var calls atomic.Int32
++	p := newPreconnectPool(100, func(ctx context.Context) (stat.Connection, error) { calls.Add(1); <-ctx.Done(); return nil, ctx.Err() })
++	defer p.Close()
++	started := time.Now()
++	for i := 0; i < 20; i++ {
++		if p.Take() != nil {
++			t.Fatal("unexpected spare")
++		}
++	}
++	if time.Since(started) > 100*time.Millisecond {
++		t.Fatal("empty pool delayed request fallback")
++	}
++	eventually(t, func() bool { return calls.Load() == 2 })
++}
++func TestPreconnectExpiryClosesWithoutIdleRefill(t *testing.T) {
++	var calls atomic.Int32
++	conn := &trackedConn{}
++	p := newPreconnectPool(1, func(context.Context) (stat.Connection, error) { calls.Add(1); return conn, nil })
++	p.ttl = 30 * time.Millisecond
++	defer p.Close()
++	p.Take()
++	eventually(t, func() bool { return readyCount(p) == 1 })
++	eventually(t, func() bool { return conn.closed.Load() == 1 })
++	time.Sleep(50 * time.Millisecond)
++	if readyCount(p) != 0 || calls.Load() != 1 {
++		t.Fatal("expired idle pool refilled without demand")
++	}
++}
++func TestPreconnectTakeTransfersOwnership(t *testing.T) {
++	ch := make(chan *trackedConn, 4)
++	p := newPreconnectPool(1, func(context.Context) (stat.Connection, error) { c := &trackedConn{}; ch <- c; return c, nil })
++	p.Take()
++	first := <-ch
++	eventually(t, func() bool { return readyCount(p) == 1 })
++	got := p.Take()
++	if got != first {
++		t.Fatal("ready connection not returned")
++	}
++	second := <-ch
++	eventually(t, func() bool { return readyCount(p) == 1 })
++	p.Close()
++	if first.closed.Load() != 0 || second.closed.Load() != 1 {
++		t.Fatal("close touched leased socket or leaked queued spare")
++	}
++	got.Close()
++}
++func TestPreconnectCloseCancelsAndDrainsConcurrentFills(t *testing.T) {
++	var canceled atomic.Int32
++	p := newPreconnectPool(2, func(ctx context.Context) (stat.Connection, error) {
++		<-ctx.Done()
++		canceled.Add(1)
++		return &trackedConn{}, ctx.Err()
++	})
++	p.Take()
++	p.Close()
++	p.Close()
++	if canceled.Load() != 2 || readyCount(p) != 0 || p.Take() != nil {
++		t.Fatal("pool did not cancel/drain or restarted after close")
++	}
++}
++func TestPreconnectFailureBackoffAndDemandOnlyRetry(t *testing.T) {
++	var calls atomic.Int32
++	p := newPreconnectPool(1, func(context.Context) (stat.Connection, error) { calls.Add(1); return nil, errors.New("offline") })
++	defer p.Close()
++	p.Take()
++	eventually(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.failures == 1 })
++	for i := 0; i < 20; i++ {
++		p.Take()
++	}
++	if calls.Load() != 1 {
++		t.Fatal("failed dial retried without cooldown")
++	}
++	time.Sleep(preconnectBackoff + 30*time.Millisecond)
++	if calls.Load() != 1 {
++		t.Fatal("idle retry burned bandwidth")
++	}
++	p.Take()
++	eventually(t, func() bool { return calls.Load() == 2 })
++}
++func TestPreconnectDialDeadline(t *testing.T) {
++	stopped := make(chan struct{})
++	p := newPreconnectPool(1, func(ctx context.Context) (stat.Connection, error) {
++		<-ctx.Done()
++		close(stopped)
++		return nil, ctx.Err()
++	})
++	p.dialTimeout = 20 * time.Millisecond
++	defer p.Close()
++	p.Take()
++	select {
++	case <-stopped:
++	case <-time.After(time.Second):
++		t.Fatal("background dial had no deadline")
++	}
++}
++
++// TLS Close may wait to send close_notify; discarding an unused reserve must
++// bypass that path so expiration cannot block an unrelated request's fallback.
++type slowTLSClose struct {
++	*trackedConn
++	gracefulCalls atomic.Int32
++	unblock       chan struct{}
++}
++
++func (c *slowTLSClose) NetConn() net.Conn { return c.trackedConn }
++func (c *slowTLSClose) Close() error      { c.gracefulCalls.Add(1); return nil }
++
++func TestPreconnectDiscardClosesRawTLSWithoutGracefulWait(t *testing.T) {
++	conn := &slowTLSClose{trackedConn: &trackedConn{}, unblock: make(chan struct{})}
++	p := newPreconnectPool(1, func(ctx context.Context) (stat.Connection, error) { <-ctx.Done(); return nil, ctx.Err() })
++	defer func() { close(conn.unblock); p.Close() }()
++	// Simulate a stale spare whose expiry callback has not yet run. Take must
++	// discard it and fall back immediately even if graceful Close would hang.
++	p.ready = []*preconnectSpare{{conn: &stat.CounterConnection{Connection: conn}, expires: time.Now().Add(-time.Second), timer: time.AfterFunc(time.Hour, func() {})}}
++	result := make(chan stat.Connection, 1)
++	go func() { result <- p.Take() }()
++	select {
++	case got := <-result:
++		if got != nil {
++			t.Fatal("expired connection was leased")
++		}
++	case <-time.After(100 * time.Millisecond):
++		t.Fatal("graceful TLS close blocked request fallback")
++	}
++	if conn.gracefulCalls.Load() != 0 || conn.closed.Load() != 1 {
++		t.Fatal("reserve discard did not close raw TLS transport directly")
++	}
++}
+--- a/transport/internet/reality/reality.go
++++ b/transport/internet/reality/reality.go
+@@ -27,6 +27,7 @@
+ 	"github.com/xtls/xray-core/common/crypto"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/utils"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+@@ -114,7 +115,16 @@
+ 	return nil
+ }
+ 
+-func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
++func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (result net.Conn, resultErr error) {
++	// Reserve dials own their raw socket until authentication succeeds. Unlike a
++	// user-requested dial, failure must not create unbounded camouflage traffic.
++	if session.IsPreconnect(ctx) {
++		defer func() {
++			if resultErr != nil {
++				c.Close()
++			}
++		}()
++	}
+ 	localAddr := c.LocalAddr().String()
+ 	uConn := &UConn{
+ 		Config: config,
+@@ -181,6 +191,9 @@
+ 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
+ 	}
+ 	if !uConn.Verified {
++		if session.IsPreconnect(ctx) {
++			return nil, errors.New("REALITY: reserve authentication failed").AtWarning()
++		}
+ 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
+ 		go func() {
+ 			client := &http.Client{
+--- /dev/null
++++ b/transport/internet/reality/preconnect_test.go
+@@ -0,0 +1,41 @@
++package reality
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"testing"
++
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++)
++
++type closeCounter struct {
++	net.Conn
++	closes atomic.Int32
++}
++
++func (c *closeCounter) Close() error { c.closes.Add(1); return c.Conn.Close() }
++
++// Configuration/handshake failures can return no wrapped connection. Verify
++// speculative dials still release the original raw socket and normal dial
++// ownership remains unchanged. All operations are local and send no packets.
++func TestReserveFailureClosesRawSocketOnlyForReserve(t *testing.T) {
++	for _, reserve := range []bool{false, true} {
++		left, right := net.Pipe()
++		c := &closeCounter{Conn: left}
++		ctx := context.Background()
++		if reserve {
++			ctx = session.ContextWithPreconnect(ctx)
++		}
++		conn, err := UClient(c, &Config{Fingerprint: "invalid-fingerprint"}, ctx, xnet.TCPDestination(xnet.LocalHostIP, 443))
++		if conn != nil || err == nil {
++			t.Fatal("invalid fingerprint accepted")
++		}
++		if (c.closes.Load() > 0) != reserve {
++			t.Fatalf("reserve=%v raw closes=%d", reserve, c.closes.Load())
++		}
++		left.Close()
++		right.Close()
++	}
++}

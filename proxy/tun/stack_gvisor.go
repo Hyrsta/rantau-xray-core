@@ -115,7 +115,15 @@ func (t *stackGVisor) Start() error {
 		src := net.UDPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort))
 		dst := net.UDPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort))
 
-		return udpForwarder.HandlePacket(src, dst, data)
+		// Retain only headers for a possible ICMP error, never application data.
+		// Copies are needed because gVisor releases pkt after this handler returns.
+		var reject func() error
+		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber && dst.Port == 443 {
+			quote := append([]byte(nil), pkt.NetworkHeader().Slice()...)
+			quote = append(quote, pkt.TransportHeader().Slice()[:header.UDPMinimumSize]...)
+			reject = func() error { return t.writeUDPPortUnreachable(quote, src, dst) }
+		}
+		return udpForwarder.HandlePacket(src, dst, data, reject)
 	})
 
 	t.stack = ipStack
@@ -261,4 +269,23 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	}
 
 	return gStack, nil
+}
+
+// writeUDPPortUnreachable answers an explicitly refused IPv4 datagram. Quoting
+// the original IP header and UDP header is sufficient for Android to match the
+// socket; the payload is neither retained nor included in the response.
+func (t *stackGVisor) writeUDPPortUnreachable(quote []byte, src, dst net.Destination) error {
+	raw := make([]byte, header.IPv4MinimumSize+header.ICMPv4MinimumSize+len(quote))
+	ip := header.IPv4(raw)
+	ip.Encode(&header.IPv4Fields{TotalLength: uint16(len(raw)), TTL: 64, Protocol: uint8(header.ICMPv4ProtocolNumber), SrcAddr: tcpip.AddrFromSlice(dst.Address.IP()), DstAddr: tcpip.AddrFromSlice(src.Address.IP())})
+	ip.SetChecksum(^ip.CalculateChecksum())
+	icmp := header.ICMPv4(raw[header.IPv4MinimumSize:])
+	icmp.SetType(header.ICMPv4DstUnreachable)
+	icmp.SetCode(header.ICMPv4PortUnreachable)
+	copy(icmp[header.ICMPv4MinimumSize:], quote)
+	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
+	if err := t.stack.WriteRawPacket(defaultNIC, header.IPv4ProtocolNumber, buffer.MakeWithData(raw)); err != nil {
+		return errors.New("failed to write local UDP refusal", err)
+	}
+	return nil
 }

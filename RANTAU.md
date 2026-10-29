@@ -23,5 +23,22 @@ what they do.
 - `infra/conf/shadowsocks.go`, `app/proxyman/outbound/handler.go` and `main/commands/all/api`: the
   Shadowsocks 2022 and UDP-over-TCP branches are removed.
 
-Everything else is unchanged from the original release. The original's `.github` folder (its build, Docker,
+## Android 0.1.27 transport changes (v26.3.27-rantau.2)
+
+- Reject unsupported Vision UDP/443 after routing but before dialing, and return an IPv4 ICMP
+  port-unreachable from the TUN inbound. Chinese/LAN direct UDP and explicitly enabled UDP443
+  remain supported. UDP send/close and stale association handling are synchronized.
+- Replace the experimental blocking preconnect workers with an optional demand-driven reserve:
+  at most two idle/in-flight sockets, two-second idle lifetime, three-second reserve dial timeout,
+  immediate normal dialing when empty, and demand-driven cooldown after failures. Idle expiry
+  never replenishes connections. Handler shutdown cancels and drains owned work.
+- Clean up speculative REALITY authentication failures without detached camouflage requests.
+  Close unused TLS reserves through the raw socket to avoid blocking foreground work.
+- Add aggregate transport counters and regression tests for routing-independent refusal,
+  concurrency, reserve ownership, cancellation, expiry and cleanup.
+
+This tag supplies the changed Xray files for Rantau VPN Android 0.1.27. Earlier apps retain their
+original source tag. The complete file set is mirrored from the vendored source used in that build.
+
+Other than these changes and the removals listed above, the source matches the original release. The original's `.github` folder (its build, Docker,
 Dependabot and issue settings) is not part of the apps and is left out here.

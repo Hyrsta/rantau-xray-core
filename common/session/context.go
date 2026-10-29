@@ -192,3 +192,29 @@ func MitmServerNameFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// udpRejectKey carries a TUN-only local refusal callback. Outbounds call it only
+// for explicit unsupported UDP requests, never for generic network failures.
+type udpRejectKey struct{}
+
+func ContextWithUDPReject(ctx context.Context, reject func()) context.Context {
+	return context.WithValue(ctx, udpRejectKey{}, reject)
+}
+
+func RejectUDP(ctx context.Context) {
+	if reject, ok := ctx.Value(udpRejectKey{}).(func()); ok {
+		reject()
+	}
+}
+
+// preconnectKey marks speculative reserve dials, never user-requested traffic.
+// A failed reserve must not spawn detached camouflage requests outside its budget.
+type preconnectKey struct{}
+
+func ContextWithPreconnect(ctx context.Context) context.Context {
+	return context.WithValue(ctx, preconnectKey{}, true)
+}
+func IsPreconnect(ctx context.Context) bool {
+	value, _ := ctx.Value(preconnectKey{}).(bool)
+	return value
+}

@@ -27,6 +27,7 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -114,7 +115,16 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	return nil
 }
 
-func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
+func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (result net.Conn, resultErr error) {
+	// Reserve dials own their raw socket until authentication succeeds. Unlike a
+	// user-requested dial, failure must not create unbounded camouflage traffic.
+	if session.IsPreconnect(ctx) {
+		defer func() {
+			if resultErr != nil {
+				c.Close()
+			}
+		}()
+	}
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
 		Config: config,
@@ -181,6 +191,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
 	}
 	if !uConn.Verified {
+		if session.IsPreconnect(ctx) {
+			return nil, errors.New("REALITY: reserve authentication failed").AtWarning()
+		}
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
 		go func() {
 			client := &http.Client{

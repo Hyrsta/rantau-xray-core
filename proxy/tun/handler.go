@@ -109,6 +109,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	ctx, cancel := context.WithCancel(t.ctx)
 	defer cancel()
 	ctx = c.ContextWithID(ctx, session.NewID())
+	if udp, ok := conn.(interface{ RejectUDP() }); ok {
+		ctx = session.ContextWithUDPReject(ctx, udp.RejectUDP)
+	}
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
 	inbound := session.Inbound{

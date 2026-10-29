@@ -3,6 +3,7 @@ package tun
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -30,31 +31,37 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 
 // HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
 // this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
-func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte) bool {
+func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte, reject func() error) bool {
 	u.Lock()
 	conn, found := u.udpConns[src]
 	if !found {
 		egress := make(chan []byte, 16)
-		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
+		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst, reject: reject}
+		if dst.Port == 443 && dst.Address.Family().IsIPv4() {
+			udp443Attempts.Add(1)
+		}
 		u.udpConns[src] = conn
 
 		go u.handleConnection(conn, dst)
 	}
-	u.Unlock()
 
+	// Keep channel send and close under the same lock; early rejection can race
+	// the very first datagram.
 	// send packet data to the egress channel, if it has buffer, or discard
 	select {
 	case conn.egress <- data:
 	default:
 	}
 
+	u.Unlock()
 	return true
 }
 
-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
+func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
+	src := c.src
 	u.Lock()
 	conn, found := u.udpConns[src]
-	if found {
+	if found && conn == c {
 		delete(u.udpConns, src)
 		close(conn.egress)
 	}
@@ -68,9 +75,11 @@ type udpConn struct {
 
 	handler *udpConnectionHandler
 
-	egress chan []byte
-	src    net.Destination
-	dst    net.Destination
+	egress     chan []byte
+	src        net.Destination
+	dst        net.Destination
+	reject     func() error
+	rejectOnce sync.Once
 }
 
 // Read packets from the connection
@@ -96,7 +105,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	c.handler.connectionFinished(c.src)
+	c.handler.connectionFinished(c)
 
 	return nil
 }
@@ -131,4 +140,21 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 
 	return nil
+}
+
+var udp443Attempts, rejectedUDP443 atomic.Int64
+
+// UDP443Attempts counts new IPv4 UDP/443 TUN associations for this process.
+// Full-cone associations are keyed by source address/port, not individual packets.
+func UDP443Attempts() int64 { return udp443Attempts.Load() }
+
+// RejectedUDP443 counts successfully emitted local IPv4 port-unreachable replies.
+func RejectedUDP443() int64 { return rejectedUDP443.Load() }
+
+func (c *udpConn) RejectUDP() {
+	c.rejectOnce.Do(func() {
+		if c.reject != nil && c.reject() == nil && c.dst.Port == 443 && c.dst.Address.Family().IsIPv4() {
+			rejectedUDP443.Add(1)
+		}
+	})
 }

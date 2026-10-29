@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	xctx "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
@@ -55,14 +54,10 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre  uint32
-	initpre  sync.Once
-	preConns chan *ConnExpire
-}
-
-type ConnExpire struct {
-	Conn   stat.Connection
-	Expire time.Time
+	testpre   uint32
+	preMu     sync.Mutex
+	prePool   *preconnectPool
+	preClosed bool
 }
 
 // New creates a new VLess outbound handler.
@@ -135,8 +130,12 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
-	if h.preConns != nil {
-		close(h.preConns)
+	h.preMu.Lock()
+	h.preClosed = true
+	pool := h.prePool
+	h.preMu.Unlock()
+	if pool != nil {
+		pool.Close()
 	}
 	if h.reverse != nil {
 		return h.reverse.Close()
@@ -154,38 +153,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "vless"
 
 	rec := h.server
+	// Vision cannot carry UDP/443 unless the client explicitly enables -udp443.
+	// Refuse after the real router has selected VLESS but before dialing/TLS, and
+	// let packet-based inbounds report the unsupported port to their application.
+	if ob.Target.Network == net.Network_UDP && ob.Target.Port == 443 && rec.User.Account.(*vless.MemoryAccount).Flow == vless.XRV && !isMuxTarget(ob.Target) {
+		session.RejectUDP(ctx)
+		return errors.New("XTLS rejected UDP/443 traffic").AtInfo()
+	}
 	var conn stat.Connection
 
 	if h.testpre > 0 && h.reverse == nil {
-		h.initpre.Do(func() {
-			h.preConns = make(chan *ConnExpire)
-			for range h.testpre { // TODO: randomize
-				go func() {
-					defer func() { recover() }()
-					ctx := xctx.ContextWithID(context.Background(), session.NewID())
-					for {
-						conn, err := dialer.Dial(ctx, rec.Destination)
-						if err != nil {
-							errors.LogWarningInner(ctx, err, "pre-connect failed")
-							continue
-						}
-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
-					}
-				}()
-			}
-		})
-		for {
-			connTime := <-h.preConns
-			if connTime == nil {
-				return errors.New("closed handler").AtWarning()
-			}
-			if time.Now().Before(connTime.Expire) {
-				conn = connTime.Conn
-				break
-			}
-			connTime.Conn.Close()
-		}
+		// A spare is optional: never queue a real request behind background dialing.
+		conn = h.takePreconnect(ctx, dialer)
 	}
 
 	if conn == nil {
@@ -486,4 +465,9 @@ func (r *Reverse) Start() error {
 
 func (r *Reverse) Close() error {
 	return r.monitorTask.Close()
+}
+
+// Special domain destinations use a different VLESS command, not UDP.
+func isMuxTarget(target net.Destination) bool {
+	return target.Address.Family().IsDomain() && (target.Address.Domain() == "v1.mux.cool" || target.Address.Domain() == "v1.rvs.cool")
 }
