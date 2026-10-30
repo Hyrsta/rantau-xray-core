@@ -33,12 +33,14 @@ const (
 
 // stackGVisor is ip stack implemented by gVisor package
 type stackGVisor struct {
-	ctx         context.Context
-	tun         GVisorTun
-	idleTimeout time.Duration
-	handler     *Handler
-	stack       *stack.Stack
-	endpoint    stack.LinkEndpoint
+	ctx             context.Context
+	tun             GVisorTun
+	idleTimeout     time.Duration
+	refuseIPv6      bool
+	deferredStartup bool
+	handler         *Handler
+	stack           *stack.Stack
+	endpoint        stack.LinkEndpoint
 }
 
 // GVisorTun implements a bridge to connect gVisor ip stack to tun interface
@@ -49,10 +51,12 @@ type GVisorTun interface {
 // NewStack builds new ip stack (using gVisor)
 func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
 	gStack := &stackGVisor{
-		ctx:         ctx,
-		tun:         options.Tun.(GVisorTun),
-		idleTimeout: options.IdleTimeout,
-		handler:     handler,
+		ctx:             ctx,
+		tun:             options.Tun.(GVisorTun),
+		idleTimeout:     options.IdleTimeout,
+		refuseIPv6:      options.RefuseIPv6,
+		deferredStartup: options.DeferredStartup,
+		handler:         handler,
 	}
 
 	return gStack, nil
@@ -65,7 +69,8 @@ func (t *stackGVisor) Start() error {
 		return err
 	}
 
-	ipStack, err := createStack(linkEndpoint)
+	endpoint := &deferredLinkEndpoint{LinkEndpoint: linkEndpoint}
+	ipStack, err := createStack(endpoint)
 	if err != nil {
 		return err
 	}
@@ -100,11 +105,19 @@ func (t *stackGVisor) Start() error {
 			r.Complete(false)
 		}(r)
 	})
-	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if t.refuseIPv6 && pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber {
+			return false
+		}
+		return tcpForwarder.HandlePacket(id, pkt)
+	})
 
 	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
 	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if t.refuseIPv6 && pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber {
+			return false
+		}
 		data := pkt.Data().AsRange().ToSlice()
 		if len(data) == 0 {
 			return false
@@ -127,9 +140,13 @@ func (t *stackGVisor) Start() error {
 	})
 
 	t.stack = ipStack
-	t.endpoint = linkEndpoint
+	t.endpoint = endpoint
 
-	return nil
+	// No packet can run until both handlers and their stack pointer are published.
+	if t.deferredStartup {
+		return nil
+	}
+	return t.Activate()
 }
 
 func (t *stackGVisor) writeRawUDPPacket(payload []byte, src net.Destination, dst net.Destination) error {
@@ -200,7 +217,7 @@ func (t *stackGVisor) Close() error {
 	if t.stack == nil {
 		return nil
 	}
-	t.endpoint.Attach(nil)
+	t.endpoint.Close()
 	t.stack.Close()
 	for _, endpoint := range t.stack.CleanupEndpoints() {
 		endpoint.Abort()
@@ -217,6 +234,13 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 		HandleLocal:        false,
 	}
 	gStack := stack.New(opts)
+	ready := false
+	defer func() {
+		if !ready {
+			gStack.Close()
+			ep.Close()
+		}
+	}()
 
 	err := gStack.CreateNIC(defaultNIC, ep)
 	if err != nil {
@@ -268,6 +292,7 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 		return nil, errors.New(err.String())
 	}
 
+	ready = true
 	return gStack, nil
 }
 
@@ -288,4 +313,9 @@ func (t *stackGVisor) writeUDPPortUnreachable(quote []byte, src, dst net.Destina
 		return errors.New("failed to write local UDP refusal", err)
 	}
 	return nil
+}
+
+// Activate publishes the initialized stack to the packet receive loop.
+func (t *stackGVisor) Activate() error {
+	return t.endpoint.(*deferredLinkEndpoint).activate()
 }

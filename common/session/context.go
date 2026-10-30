@@ -218,3 +218,18 @@ func IsPreconnect(ctx context.Context) bool {
 	value, _ := ctx.Value(preconnectKey{}).(bool)
 	return value
 }
+
+// preconnectDisabledKey keeps internal health traffic independent of application
+// reserves. It neither consumes a spare nor creates speculative refill work.
+// This is separate from preconnectKey: the request is real traffic and retains
+// normal transport authentication, cancellation and failure handling.
+type preconnectDisabledKey struct{}
+
+func ContextWithPreconnectDisabled(ctx context.Context) context.Context {
+	return context.WithValue(ctx, preconnectDisabledKey{}, true)
+}
+
+func IsPreconnectDisabled(ctx context.Context) bool {
+	value, _ := ctx.Value(preconnectDisabledKey{}).(bool)
+	return value
+}

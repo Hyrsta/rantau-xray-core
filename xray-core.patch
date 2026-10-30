@@ -19,6 +19,80 @@
  	conn, err := internet.Dial(ctx, dest, h.streamSettings)
  	conn = h.getStatCouterConnection(conn)
  	outbounds := session.OutboundsFromContext(ctx)
+--- a/common/session/context.go
++++ b/common/session/context.go
+@@ -192,3 +192,44 @@
+ 	}
+ 	return ""
+ }
++
++// udpRejectKey carries a TUN-only local refusal callback. Outbounds call it only
++// for explicit unsupported UDP requests, never for generic network failures.
++type udpRejectKey struct{}
++
++func ContextWithUDPReject(ctx context.Context, reject func()) context.Context {
++	return context.WithValue(ctx, udpRejectKey{}, reject)
++}
++
++func RejectUDP(ctx context.Context) {
++	if reject, ok := ctx.Value(udpRejectKey{}).(func()); ok {
++		reject()
++	}
++}
++
++// preconnectKey marks speculative reserve dials, never user-requested traffic.
++// A failed reserve must not spawn detached camouflage requests outside its budget.
++type preconnectKey struct{}
++
++func ContextWithPreconnect(ctx context.Context) context.Context {
++	return context.WithValue(ctx, preconnectKey{}, true)
++}
++func IsPreconnect(ctx context.Context) bool {
++	value, _ := ctx.Value(preconnectKey{}).(bool)
++	return value
++}
++
++// preconnectDisabledKey keeps internal health traffic independent of application
++// reserves. It neither consumes a spare nor creates speculative refill work.
++// This is separate from preconnectKey: the request is real traffic and retains
++// normal transport authentication, cancellation and failure handling.
++type preconnectDisabledKey struct{}
++
++func ContextWithPreconnectDisabled(ctx context.Context) context.Context {
++	return context.WithValue(ctx, preconnectDisabledKey{}, true)
++}
++
++func IsPreconnectDisabled(ctx context.Context) bool {
++	value, _ := ctx.Value(preconnectDisabledKey{}).(bool)
++	return value
++}
+--- /dev/null
++++ b/common/session/preconnect_test.go
+@@ -0,0 +1,24 @@
++package session
++
++import (
++	"context"
++	"testing"
++)
++
++func TestPreconnectDisabledIsIndependentAndPreservesContext(t *testing.T) {
++	parent, cancel := context.WithCancel(context.Background())
++	ctx := ContextWithPreconnectDisabled(parent)
++	if !IsPreconnectDisabled(ctx) || IsPreconnect(ctx) || IsPreconnectDisabled(parent) || IsPreconnectDisabled(ContextWithPreconnect(parent)) {
++		t.Fatal("health and speculative authentication markers overlap")
++	}
++	child := ContextWithOutbounds(ctx, []*Outbound{{Name: "vless"}})
++	if !IsPreconnectDisabled(child) || IsPreconnect(child) {
++		t.Fatal("session wrapping lost health marker")
++	}
++	cancel()
++	select {
++	case <-child.Done():
++	default:
++		t.Fatal("health marker detached request cancellation")
++	}
++}
 --- a/infra/conf/shadowsocks.go
 +++ b/infra/conf/shadowsocks.go
 @@ -1,17 +1,25 @@
@@ -184,157 +258,72 @@
  	default:
  		fmt.Println("unsupported inbound type")
  	}
---- a/proxy/wireguard/tun_linux.go
-+++ b/proxy/wireguard/tun_linux.go
-@@ -10,10 +10,10 @@
- 	"net/netip"
- 	"os"
- 	"sync"
-+	"syscall"
- 
- 	"golang.org/x/sys/unix"
- 
--	"github.com/sagernet/sing/common/control"
- 	"github.com/vishvananda/netlink"
- 	"github.com/xtls/xray-core/common/errors"
- 	wgtun "golang.zx2c4.com/wireguard/tun"
-@@ -48,8 +48,15 @@
- 
- func newDeviceNet(interfaceName string) *deviceNet {
- 	var dialer net.Dialer
--	bindControl := control.BindToInterface(control.NewDefaultInterfaceFinder(), interfaceName, -1)
--	dialer.Control = control.Append(dialer.Control, bindControl)
-+	dialer.Control = func(network, address string, conn syscall.RawConn) error {
-+		var bindErr error
-+		if err := conn.Control(func(fd uintptr) {
-+			bindErr = unix.BindToDevice(int(fd), interfaceName)
-+		}); err != nil {
-+			return err
-+		}
-+		return bindErr
-+	}
- 	return &deviceNet{dialer: dialer}
- }
- 
---- a/transport/internet/system_dialer.go
-+++ b/transport/internet/system_dialer.go
-@@ -5,7 +5,6 @@
- 	"syscall"
- 	"time"
- 
--	"github.com/sagernet/sing/common/control"
- 	"github.com/xtls/xray-core/common/errors"
- 	"github.com/xtls/xray-core/common/net"
- 	"github.com/xtls/xray-core/features/dns"
-@@ -20,7 +19,7 @@
- }
- 
- type DefaultSystemDialer struct {
--	controllers []control.Func
-+	controllers []ControlFunc
- 	dns         dns.Client
- 	obm         outbound.Manager
- }
-@@ -204,7 +203,10 @@
- // It only works when effective dialer is the default dialer.
- //
- // xray:api:beta
--func RegisterDialerController(ctl control.Func) error {
-+// ControlFunc is a socket hook with the same shape as net.Dialer.Control.
-+type ControlFunc = func(network, address string, conn syscall.RawConn) error
-+
-+func RegisterDialerController(ctl ControlFunc) error {
- 	if ctl == nil {
- 		return errors.New("nil listener controller")
- 	}
---- a/transport/internet/system_listener.go
-+++ b/transport/internet/system_listener.go
-@@ -10,7 +10,6 @@
- 	"time"
- 
- 	"github.com/pires/go-proxyproto"
--	"github.com/sagernet/sing/common/control"
- 	"github.com/xtls/xray-core/common/errors"
- 	"github.com/xtls/xray-core/common/net"
- )
-@@ -18,10 +17,10 @@
- var effectiveListener = DefaultListener{}
- 
- type DefaultListener struct {
--	controllers []control.Func
-+	controllers []ControlFunc
- }
- 
--func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []control.Func) func(network, address string, c syscall.RawConn) error {
-+func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []ControlFunc) func(network, address string, c syscall.RawConn) error {
- 	return func(network, address string, c syscall.RawConn) error {
- 		return c.Control(func(fd uintptr) {
- 			for _, controller := range controllers {
-@@ -186,7 +185,7 @@
- // The controller can be used to operate on file descriptors before they are put into use.
- //
- // xray:api:beta
--func RegisterListenerController(controller control.Func) error {
-+func RegisterListenerController(controller ControlFunc) error {
- 	if controller == nil {
- 		return errors.New("nil listener controller")
- 	}
---- a/transport/internet/system_listener_test.go
-+++ b/transport/internet/system_listener_test.go
-@@ -6,7 +6,6 @@
- 	"syscall"
- 	"testing"
- 
--	"github.com/sagernet/sing/common/control"
- 	"github.com/xtls/xray-core/common"
- 	"github.com/xtls/xray-core/transport/internet"
- )
-@@ -15,9 +14,8 @@
- 	var gotFd uintptr
- 
- 	common.Must(internet.RegisterListenerController(func(network, address string, conn syscall.RawConn) error {
--		return control.Raw(conn, func(fd uintptr) error {
-+		return conn.Control(func(fd uintptr) {
- 			gotFd = fd
--			return nil
- 		})
- 	}))
- 
---- a/common/session/context.go
-+++ b/common/session/context.go
-@@ -192,3 +192,29 @@
- 	}
- 	return ""
- }
-+
-+// udpRejectKey carries a TUN-only local refusal callback. Outbounds call it only
-+// for explicit unsupported UDP requests, never for generic network failures.
-+type udpRejectKey struct{}
-+
-+func ContextWithUDPReject(ctx context.Context, reject func()) context.Context {
-+	return context.WithValue(ctx, udpRejectKey{}, reject)
-+}
-+
-+func RejectUDP(ctx context.Context) {
-+	if reject, ok := ctx.Value(udpRejectKey{}).(func()); ok {
-+		reject()
-+	}
-+}
-+
-+// preconnectKey marks speculative reserve dials, never user-requested traffic.
-+// A failed reserve must not spawn detached camouflage requests outside its budget.
-+type preconnectKey struct{}
-+
-+func ContextWithPreconnect(ctx context.Context) context.Context {
-+	return context.WithValue(ctx, preconnectKey{}, true)
-+}
-+func IsPreconnect(ctx context.Context) bool {
-+	value, _ := ctx.Value(preconnectKey{}).(bool)
-+	return value
-+}
 --- a/proxy/tun/handler.go
 +++ b/proxy/tun/handler.go
-@@ -109,6 +109,9 @@
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"sync"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+@@ -70,27 +71,46 @@
+ 
+ 	errors.LogInfo(t.ctx, tunName, " created")
+ 
++	refuseIPv6, _ := ctx.Value(ipv6RefusalKey{}).(bool)
++	startup, _ := ctx.Value(deferredStartupKey{}).(*deferredStartupState)
++	var tunStack Stack
++	var cleanupOnce sync.Once
++	cleanup := func() {
++		cleanupOnce.Do(func() {
++			if tunStack != nil {
++				_ = tunStack.Close()
++			}
++			if startup != nil && startup.cleanup != nil {
++				startup.cleanup(tunInterface)
++			} else {
++				_ = tunInterface.Close()
++			}
++		})
++	}
++	if startup != nil {
++		startup.add(cleanup)
++	}
+ 	tunStackOptions := StackOptions{
+-		Tun:         tunInterface,
+-		IdleTimeout: pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
++		Tun:             tunInterface,
++		IdleTimeout:     pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
++		RefuseIPv6:      refuseIPv6,
++		DeferredStartup: startup != nil,
+ 	}
+-	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
++	tunStack, err = NewStack(t.ctx, tunStackOptions, t)
+ 	if err != nil {
+-		_ = tunInterface.Close()
++		cleanup()
+ 		return err
+ 	}
+ 
+ 	err = tunStack.Start()
+ 	if err != nil {
+-		_ = tunStack.Close()
+-		_ = tunInterface.Close()
++		cleanup()
+ 		return err
+ 	}
+ 
+ 	err = tunInterface.Start()
+ 	if err != nil {
+-		_ = tunStack.Close()
+-		_ = tunInterface.Close()
++		cleanup()
+ 		return err
+ 	}
+ 
+@@ -109,6 +129,9 @@
  	ctx, cancel := context.WithCancel(t.ctx)
  	defer cancel()
  	ctx = c.ContextWithID(ctx, session.NewID())
@@ -344,9 +333,101 @@
  
  	source := net.DestinationFromAddr(conn.RemoteAddr())
  	inbound := session.Inbound{
+@@ -166,3 +189,9 @@
+ 		return t, err
+ 	}))
+ }
++
++// Activate starts packet reads for an instance created with WithDeferredStartup.
++// Call only after the core instance and its outbounds have started.
++func (t *Handler) Activate() error {
++	return t.stack.(interface{ Activate() error }).Activate()
++}
+--- a/proxy/tun/stack.go
++++ b/proxy/tun/stack.go
+@@ -12,6 +12,8 @@
+ 
+ // StackOptions for the stack implementation
+ type StackOptions struct {
+-	Tun         Tun
+-	IdleTimeout time.Duration
++	Tun             Tun
++	IdleTimeout     time.Duration
++	RefuseIPv6      bool
++	DeferredStartup bool
+ }
 --- a/proxy/tun/stack_gvisor.go
 +++ b/proxy/tun/stack_gvisor.go
-@@ -115,7 +115,15 @@
+@@ -33,12 +33,14 @@
+ 
+ // stackGVisor is ip stack implemented by gVisor package
+ type stackGVisor struct {
+-	ctx         context.Context
+-	tun         GVisorTun
+-	idleTimeout time.Duration
+-	handler     *Handler
+-	stack       *stack.Stack
+-	endpoint    stack.LinkEndpoint
++	ctx             context.Context
++	tun             GVisorTun
++	idleTimeout     time.Duration
++	refuseIPv6      bool
++	deferredStartup bool
++	handler         *Handler
++	stack           *stack.Stack
++	endpoint        stack.LinkEndpoint
+ }
+ 
+ // GVisorTun implements a bridge to connect gVisor ip stack to tun interface
+@@ -49,10 +51,12 @@
+ // NewStack builds new ip stack (using gVisor)
+ func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
+ 	gStack := &stackGVisor{
+-		ctx:         ctx,
+-		tun:         options.Tun.(GVisorTun),
+-		idleTimeout: options.IdleTimeout,
+-		handler:     handler,
++		ctx:             ctx,
++		tun:             options.Tun.(GVisorTun),
++		idleTimeout:     options.IdleTimeout,
++		refuseIPv6:      options.RefuseIPv6,
++		deferredStartup: options.DeferredStartup,
++		handler:         handler,
+ 	}
+ 
+ 	return gStack, nil
+@@ -65,7 +69,8 @@
+ 		return err
+ 	}
+ 
+-	ipStack, err := createStack(linkEndpoint)
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: linkEndpoint}
++	ipStack, err := createStack(endpoint)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -100,11 +105,19 @@
+ 			r.Complete(false)
+ 		}(r)
+ 	})
+-	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
++	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
++		if t.refuseIPv6 && pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber {
++			return false
++		}
++		return tcpForwarder.HandlePacket(id, pkt)
++	})
+ 
+ 	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
+ 	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
+ 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
++		if t.refuseIPv6 && pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber {
++			return false
++		}
+ 		data := pkt.Data().AsRange().ToSlice()
+ 		if len(data) == 0 {
+ 			return false
+@@ -115,13 +128,25 @@
  		src := net.UDPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort))
  		dst := net.UDPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort))
  
@@ -363,8 +444,47 @@
  	})
  
  	t.stack = ipStack
-@@ -262,3 +270,22 @@
+-	t.endpoint = linkEndpoint
+-
+-	return nil
++	t.endpoint = endpoint
++
++	// No packet can run until both handlers and their stack pointer are published.
++	if t.deferredStartup {
++		return nil
++	}
++	return t.Activate()
+ }
  
+ func (t *stackGVisor) writeRawUDPPacket(payload []byte, src net.Destination, dst net.Destination) error {
+@@ -192,7 +217,7 @@
+ 	if t.stack == nil {
+ 		return nil
+ 	}
+-	t.endpoint.Attach(nil)
++	t.endpoint.Close()
+ 	t.stack.Close()
+ 	for _, endpoint := range t.stack.CleanupEndpoints() {
+ 		endpoint.Abort()
+@@ -209,6 +234,13 @@
+ 		HandleLocal:        false,
+ 	}
+ 	gStack := stack.New(opts)
++	ready := false
++	defer func() {
++		if !ready {
++			gStack.Close()
++			ep.Close()
++		}
++	}()
+ 
+ 	err := gStack.CreateNIC(defaultNIC, ep)
+ 	if err != nil {
+@@ -260,5 +292,30 @@
+ 		return nil, errors.New(err.String())
+ 	}
+ 
++	ready = true
  	return gStack, nil
  }
 +
@@ -386,9 +506,578 @@
 +	}
 +	return nil
 +}
++
++// Activate publishes the initialized stack to the packet receive loop.
++func (t *stackGVisor) Activate() error {
++	return t.endpoint.(*deferredLinkEndpoint).activate()
++}
+--- /dev/null
++++ b/proxy/tun/stack_startup.go
+@@ -0,0 +1,145 @@
++package tun
++
++import (
++	"context"
++	"errors"
++	"sync"
++
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++type ipv6RefusalKey struct{}
++type deferredStartupKey struct{}
++
++// WithDeferredStartup keeps TUN packet reads paused until Handler.Activate is
++// called after the core instance and its outbounds have started.
++func WithDeferredStartup(ctx context.Context) context.Context {
++	return WithDeferredStartupCleanup(ctx, nil)
++}
++
++// WithDeferredStartupCleanup also supplies device cleanup for embedders that own
++// a duplicated VPN descriptor. Registration happens immediately after NewTun,
++// so even a partially failed inbound constructor uses the same ownership rule.
++func WithDeferredStartupCleanup(ctx context.Context, cleanup func(Tun)) context.Context {
++	return context.WithValue(ctx, deferredStartupKey{}, &deferredStartupState{cleanup: cleanup})
++}
++
++type deferredStartupState struct {
++	mu              sync.Mutex
++	cleanup         func(Tun)
++	resources       []func()
++	closed, handled bool
++}
++
++func (s *deferredStartupState) add(cleanup func()) {
++	s.mu.Lock()
++	s.handled = true
++	if !s.closed {
++		s.resources = append(s.resources, cleanup)
++		s.mu.Unlock()
++		return
++	}
++	s.mu.Unlock()
++	cleanup()
++}
++
++// CleanupDeferredStartup releases resources when core.New fails without
++// returning an instance. True means an initialized device was handled; repeated
++// calls remain true and cannot close a reused descriptor.
++func CleanupDeferredStartup(ctx context.Context) bool {
++	s, _ := ctx.Value(deferredStartupKey{}).(*deferredStartupState)
++	if s == nil {
++		return false
++	}
++	s.mu.Lock()
++	s.closed = true
++	resources := s.resources
++	s.resources = nil
++	handled := s.handled
++	s.mu.Unlock()
++	for _, cleanup := range resources {
++		cleanup()
++	}
++	return handled
++}
++
++// WithIPv6Refusal asks this TUN instance to refuse IPv6 TCP/UDP before accepting
++// traffic. Clients without IPv6 egress can request IPv4 fallback; other users
++// retain the normal IPv6 forwarding behavior. The setting is instance-local.
++func WithIPv6Refusal(ctx context.Context) context.Context {
++	return context.WithValue(ctx, ipv6RefusalKey{}, true)
++}
++
++// CreateNIC attaches its endpoint immediately, before the stack's transport
++// handlers and route configuration are ready. Defer that attachment until the
++// owner explicitly activates it. Activation publishes all initialization before
++// the underlying endpoint starts its receive goroutines, including fdbased.
++type deferredLinkEndpoint struct {
++	stack.LinkEndpoint
++	mu             sync.Mutex
++	dispatcher     stack.NetworkDispatcher
++	active, closed bool
++}
++
++func (e *deferredLinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if e.closed {
++		return
++	}
++	e.dispatcher = dispatcher
++	if e.active {
++		e.LinkEndpoint.Attach(dispatcher)
++	}
++}
++
++func (e *deferredLinkEndpoint) IsAttached() bool {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	return !e.closed && e.dispatcher != nil
++}
++
++func (e *deferredLinkEndpoint) activate() error {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if e.closed {
++		return errors.New("TUN endpoint closed before activation")
++	}
++	if !e.active {
++		e.active = true
++		if e.dispatcher != nil {
++			e.LinkEndpoint.Attach(e.dispatcher)
++		}
++	}
++	return nil
++}
++
++func (e *deferredLinkEndpoint) Close() {
++	e.mu.Lock()
++	if e.closed {
++		e.mu.Unlock()
++		return
++	}
++	e.closed = true
++	e.dispatcher = nil
++	if e.active {
++		e.LinkEndpoint.Attach(nil)
++	}
++	e.mu.Unlock()
++	e.LinkEndpoint.Close()
++}
++
++// Embedding LinkEndpoint forwards all required capabilities. GSO is an optional
++// interface, so forward it explicitly rather than silently disabling it.
++func (e *deferredLinkEndpoint) GSOMaxSize() uint32 {
++	if gso, ok := e.LinkEndpoint.(stack.GSOEndpoint); ok {
++		return gso.GSOMaxSize()
++	}
++	return 0
++}
++func (e *deferredLinkEndpoint) SupportedGSO() stack.SupportedGSO {
++	if gso, ok := e.LinkEndpoint.(stack.GSOEndpoint); ok {
++		return gso.SupportedGSO()
++	}
++	return stack.GSONotSupported
++}
+--- /dev/null
++++ b/proxy/tun/stack_startup_test.go
+@@ -0,0 +1,132 @@
++package tun
++
++import (
++	"context"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++type startupDispatcher struct{ stack.NetworkDispatcher }
++type startupEndpoint struct {
++	stack.LinkEndpoint
++	calls    []stack.NetworkDispatcher
++	closes   int
++	onAttach func()
++}
++
++func (e *startupEndpoint) Attach(d stack.NetworkDispatcher) {
++	e.calls = append(e.calls, d)
++	if d != nil && e.onAttach != nil {
++		e.onAttach()
++	}
++}
++func (e *startupEndpoint) Close()                           { e.closes++ }
++func (e *startupEndpoint) GSOMaxSize() uint32               { return 12345 }
++func (e *startupEndpoint) SupportedGSO() stack.SupportedGSO { return stack.HostGSOSupported }
++
++func TestEndpointActivationPublishesInitialization(t *testing.T) {
++	initialized := 0
++	seen := make(chan int, 1)
++	underlying := &startupEndpoint{onAttach: func() { go func() { seen <- initialized }() }}
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
++	dispatcher := &startupDispatcher{}
++	endpoint.Attach(dispatcher)
++	if len(underlying.calls) != 0 || !endpoint.IsAttached() {
++		t.Fatal("attachment started reads before activation")
++	}
++	initialized = 42
++	if err := endpoint.activate(); err != nil {
++		t.Fatal(err)
++	}
++	if got := <-seen; got != 42 {
++		t.Fatalf("receiver saw partially initialized state %d", got)
++	}
++	if err := endpoint.activate(); err != nil {
++		t.Fatal(err)
++	}
++	if len(underlying.calls) != 1 || underlying.calls[0] != dispatcher {
++		t.Fatal("activation must attach exactly once")
++	}
++	if endpoint.GSOMaxSize() != 12345 || endpoint.SupportedGSO() != stack.HostGSOSupported {
++		t.Fatal("optional GSO capabilities lost")
++	}
++	endpoint.Attach(nil)
++	if endpoint.IsAttached() || len(underlying.calls) != 2 || underlying.calls[1] != nil {
++		t.Fatal("detach not forwarded")
++	}
++	endpoint.Close()
++}
++
++func TestEndpointClosedBeforeActivationNeverStartsReads(t *testing.T) {
++	underlying := &startupEndpoint{}
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
++	endpoint.Attach(&startupDispatcher{})
++	endpoint.Close()
++	endpoint.Close()
++	if err := endpoint.activate(); err == nil {
++		t.Fatal("closed endpoint reactivated")
++	}
++	endpoint.Attach(&startupDispatcher{})
++	if len(underlying.calls) != 0 || underlying.closes != 1 || endpoint.IsAttached() {
++		t.Fatal("closed pending endpoint leaked a reader or closed twice")
++	}
++}
++
++func TestEndpointDetachedBeforeActivationDoesNotStartReader(t *testing.T) {
++	underlying := &startupEndpoint{}
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
++	endpoint.Attach(&startupDispatcher{})
++	endpoint.Attach(nil)
++	if err := endpoint.activate(); err != nil {
++		t.Fatal(err)
++	}
++	if len(underlying.calls) != 0 {
++		t.Fatal("detached dispatcher started reader")
++	}
++	endpoint.Close()
++}
++
++func TestStartupPolicyIsOptInAndInstanceLocal(t *testing.T) {
++	ordinary := context.Background()
++	guarded := WithDeferredStartup(WithIPv6Refusal(ordinary))
++	if ordinary.Value(ipv6RefusalKey{}) != nil || ordinary.Value(deferredStartupKey{}) != nil {
++		t.Fatal("ordinary instances inherited Rantau policy")
++	}
++	if guarded.Value(ipv6RefusalKey{}) != true || guarded.Value(deferredStartupKey{}) == nil {
++		t.Fatal("instance policy missing")
++	}
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: &LinkEndpoint{}}
++	if endpoint.GSOMaxSize() != 0 || endpoint.SupportedGSO() != stack.GSONotSupported {
++		t.Fatal("non-GSO endpoint gained GSO capability")
++	}
++}
++
++func TestClosedStackCannotActivateDeferredEndpoint(t *testing.T) {
++	underlying := &startupEndpoint{}
++	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
++	endpoint.Attach(&startupDispatcher{})
++	tunStack := &stackGVisor{stack: stack.New(stack.Options{}), endpoint: endpoint}
++	if err := tunStack.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := tunStack.Activate(); err == nil {
++		t.Fatal("closed stack activated its deferred reader")
++	}
++	if len(underlying.calls) != 0 || underlying.closes != 1 {
++		t.Fatal("closed stack leaked a reader or device")
++	}
++}
++
++func TestDeferredStartupCleanupIsIdempotent(t *testing.T) {
++	ctx := WithDeferredStartup(context.Background())
++	state := ctx.Value(deferredStartupKey{}).(*deferredStartupState)
++	calls := 0
++	state.add(func() { calls++ })
++	if !CleanupDeferredStartup(ctx) || !CleanupDeferredStartup(ctx) || calls != 1 {
++		t.Fatal("resource cleanup or ownership was repeated/lost")
++	}
++	if CleanupDeferredStartup(context.Background()) {
++		t.Fatal("ordinary instance claimed device ownership")
++	}
++}
+--- /dev/null
++++ b/proxy/tun/udp_buffer_test.go
+@@ -0,0 +1,83 @@
++package tun
++
++import (
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++)
++
++type udpOwnedBufferReader struct{ mb buf.MultiBuffer }
++
++func (r *udpOwnedBufferReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	mb := r.mb
++	r.mb = nil
++	return mb, io.EOF
++}
++
++// Exercise the caller's actual buf.Copy -> buf.NewWriter(conn) ownership path.
++// No caller releases transferred buffers; both delivered and discarded packets
++// must return their storage to the pool after payload/metadata use is finished.
++func TestUDPWriterReleasesDeliveredSkippedAndFailedBuffers(t *testing.T) {
++	client := net.UDPDestination(net.ParseAddress("172.19.0.2"), 41004)
++	remote := net.UDPDestination(net.ParseAddress("198.51.100.1"), 3478)
++	alternate := net.UDPDestination(net.ParseAddress("198.51.100.2"), 50000)
++	incompatible := net.UDPDestination(net.ParseAddress("2001:db8::1"), 3478)
++	tests := []struct {
++		payload string
++		from    *net.Destination
++	}{
++		{"default", nil},
++		{"alternate", &alternate},
++		{"skipped family", &incompatible},
++		{"failed write", &alternate},
++		{"after failure", nil},
++	}
++	mb := make(buf.MultiBuffer, len(tests))
++	for i, test := range tests {
++		mb[i] = buf.New()
++		mb[i].Write([]byte(test.payload))
++		mb[i].UDP = test.from
++	}
++	// Keep object references separately: ReleaseMulti must clear the input slice.
++	objects := append(buf.MultiBuffer(nil), mb...)
++	t.Cleanup(func() { buf.ReleaseMulti(objects) }) // also cleans a failing regression
++	writes := 0
++	wantIndices := []int{0, 1, 3, 4}
++	h := newUdpConnectionHandler(nil, func(p []byte, from, to net.Destination) error {
++		if writes >= len(wantIndices) {
++			t.Fatal("incompatible-family buffer was written")
++		}
++		i := wantIndices[writes]
++		want := tests[i]
++		wantSource := remote
++		if want.from != nil {
++			wantSource = *want.from
++		}
++		if string(p) != want.payload || from != wantSource || to != client {
++			t.Fatalf("incorrect packet before release: %q %v -> %v", p, from, to)
++		}
++		if string(objects[i].Bytes()) != want.payload || objects[i].UDP != want.from {
++			t.Fatal("payload or UDP metadata released before writePacket returned")
++		}
++		writes++
++		if want.payload == "failed write" {
++			return errors.New("synthetic packet write failure")
++		}
++		return nil
++	})
++	conn := &udpConn{handler: h, src: client, dst: remote}
++	if err := buf.Copy(&udpOwnedBufferReader{mb: mb}, buf.NewWriter(conn)); err != nil {
++		t.Fatal(err)
++	}
++	if writes != len(wantIndices) {
++		t.Fatalf("got %d packet writes, want %d", writes, len(wantIndices))
++	}
++	for i, b := range objects {
++		if mb[i] != nil || b.Len() != 0 || b.Bytes() != nil || b.UDP != nil {
++			t.Fatalf("buffer %d was not released after write/discard", i)
++		}
++	}
++}
+--- /dev/null
++++ b/proxy/tun/udp_destinations_test.go
+@@ -0,0 +1,192 @@
++package tun
++
++import (
++	"bytes"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++)
++
++type udpDispatch struct {
++	conn *udpConn
++	dest net.Destination
++}
++
++func udpTestHandler(t *testing.T, reply func([]byte, net.Destination, net.Destination) error) (*udpConnectionHandler, chan udpDispatch) {
++	t.Helper()
++	dispatched := make(chan udpDispatch, 16)
++	h := newUdpConnectionHandler(func(c net.Conn, dest net.Destination) { dispatched <- udpDispatch{c.(*udpConn), dest} }, reply)
++	t.Cleanup(func() {
++		h.Lock()
++		conns := make([]*udpConn, 0, len(h.udpConns))
++		for _, c := range h.udpConns {
++			conns = append(conns, c)
++		}
++		h.Unlock()
++		for _, c := range conns {
++			c.Close()
++		}
++	})
++	return h, dispatched
++}
++
++func nextUDPDispatch(t *testing.T, dispatched <-chan udpDispatch, want net.Destination) *udpConn {
++	t.Helper()
++	select {
++	case got := <-dispatched:
++		if got.dest != want {
++			t.Fatalf("routed to %v, want %v", got.dest, want)
++		}
++		return got.conn
++	case <-time.After(time.Second):
++		t.Fatalf("destination %v received no routing decision", want)
++		return nil
++	}
++}
++
++func requireUDPRead(t *testing.T, c *udpConn, want string) {
++	t.Helper()
++	data := make([]byte, 256)
++	n, err := c.Read(data)
++	if err != nil || !bytes.Equal(data[:n], []byte(want)) {
++		t.Fatalf("payload %q (%v), want %q", data[:n], err, want)
++	}
++}
++
++// ICE/STUN clients commonly send to multiple destinations from one UDP socket.
++// Each must be routed independently; neither a different address nor a port may
++// inherit the first packet's destination or its direct/proxy route.
++func TestUDPSameSocketRoutesEachDestination(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 41000)
++	destinations := []net.Destination{
++		net.UDPDestination(net.ParseAddress("198.51.100.1"), 3478),
++		net.UDPDestination(net.ParseAddress("198.51.100.2"), 3478),
++		net.UDPDestination(net.ParseAddress("198.51.100.1"), 443),
++		net.UDPDestination(net.ParseAddress("192.168.1.1"), 443),
++	}
++	h, dispatched := udpTestHandler(t, nil)
++	conns := make([]*udpConn, 0, len(destinations))
++	for i, dst := range destinations {
++		payload := string(rune('a' + i))
++		h.HandlePacket(src, dst, []byte(payload), nil)
++		c := nextUDPDispatch(t, dispatched, dst)
++		requireUDPRead(t, c, payload)
++		conns = append(conns, c)
++	}
++	// Fresh address objects from packet parsing must reuse the same association.
++	for i, dst := range destinations {
++		parsedSrc := net.UDPDestination(net.IPAddress([]byte{172, 19, 0, 2}), 41000)
++		parsedDst := net.UDPDestination(net.IPAddress(dst.Address.IP()), dst.Port)
++		h.HandlePacket(parsedSrc, parsedDst, []byte("repeat"), nil)
++		requireUDPRead(t, conns[i], "repeat")
++	}
++	select {
++	case got := <-dispatched:
++		t.Fatalf("same tuple created another association: %v", got.dest)
++	default:
++	}
++}
++
++// A refused foreign QUIC destination cannot close a domestic UDP association or
++// invoke that association's ICMP callback merely because the app reuses a socket.
++func TestUDPRefusalIsIsolatedToDestination(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 41001)
++	direct := net.UDPDestination(net.ParseAddress("192.168.1.1"), 443)
++	proxy := net.UDPDestination(net.ParseAddress("198.51.100.1"), 443)
++	h, dispatched := udpTestHandler(t, nil)
++	var directRefusals, proxyRefusals atomic.Int32
++	h.HandlePacket(src, direct, []byte("direct"), func() error { directRefusals.Add(1); return nil })
++	dc := nextUDPDispatch(t, dispatched, direct)
++	requireUDPRead(t, dc, "direct")
++	h.HandlePacket(src, proxy, []byte("proxy"), func() error { proxyRefusals.Add(1); return nil })
++	pc := nextUDPDispatch(t, dispatched, proxy)
++	requireUDPRead(t, pc, "proxy")
++	pc.RejectUDP()
++	pc.RejectUDP()
++	pc.Close()
++	h.HandlePacket(src, direct, []byte("still direct"), nil)
++	requireUDPRead(t, dc, "still direct")
++	if directRefusals.Load() != 0 || proxyRefusals.Load() != 1 {
++		t.Fatalf("refusals direct=%d proxy=%d", directRefusals.Load(), proxyRefusals.Load())
++	}
++}
++
++func TestUDPDestinationRepliesKeepTheirSourceAndFullConeMetadata(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 41002)
++	first := net.UDPDestination(net.ParseAddress("198.51.100.1"), 3478)
++	second := net.UDPDestination(net.ParseAddress("198.51.100.2"), 3478)
++	alternate := net.UDPDestination(net.ParseAddress("198.51.100.3"), 50000)
++	type reply struct {
++		from, to net.Destination
++		payload  string
++	}
++	replies := make(chan reply, 3)
++	h, dispatched := udpTestHandler(t, func(p []byte, from, to net.Destination) error { replies <- reply{from, to, string(p)}; return nil })
++	h.HandlePacket(src, first, []byte("a"), nil)
++	fc := nextUDPDispatch(t, dispatched, first)
++	h.HandlePacket(src, second, []byte("b"), nil)
++	sc := nextUDPDispatch(t, dispatched, second)
++	fc.Write([]byte("first"))
++	sc.Write([]byte("second"))
++	b := buf.New()
++	b.Write([]byte("alternate"))
++	b.UDP = &alternate
++	if err := fc.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
++		t.Fatal(err)
++	}
++	for _, want := range []reply{{first, src, "first"}, {second, src, "second"}, {alternate, src, "alternate"}} {
++		if got := <-replies; got != want {
++			t.Fatalf("reply %+v, want %+v", got, want)
++		}
++	}
++}
++
++func TestUDPConcurrentDestinationsKeepPayloadsSeparate(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 41003)
++	var workers sync.WaitGroup
++	h := newUdpConnectionHandler(func(c net.Conn, dest net.Destination) {
++		defer workers.Done()
++		defer c.Close()
++		p := make([]byte, 64)
++		for {
++			n, err := c.Read(p)
++			if err != nil {
++				return
++			}
++			if n != 1 || p[0] != byte(dest.Port-5000) {
++				t.Errorf("payload %v sent to %v", p[:n], dest)
++			}
++		}
++	}, nil)
++	destinations := make([]net.Destination, 4)
++	for i := range destinations {
++		destinations[i] = net.UDPDestination(net.ParseAddress("198.51.100.1"), net.Port(5000+i))
++		workers.Add(1)
++		h.HandlePacket(src, destinations[i], []byte{byte(i)}, nil)
++	}
++	var senders sync.WaitGroup
++	for i, dst := range destinations {
++		senders.Add(1)
++		go func(i int, dst net.Destination) {
++			defer senders.Done()
++			for j := 0; j < 100; j++ {
++				h.HandlePacket(src, dst, []byte{byte(i)}, nil)
++			}
++		}(i, dst)
++	}
++	senders.Wait()
++	h.Lock()
++	conns := make([]*udpConn, 0, len(h.udpConns))
++	for _, c := range h.udpConns {
++		conns = append(conns, c)
++	}
++	h.Unlock()
++	for _, c := range conns {
++		c.Close()
++	}
++	workers.Wait()
++}
 --- a/proxy/tun/udp_fullcone.go
 +++ b/proxy/tun/udp_fullcone.go
-@@ -3,6 +3,7 @@
+@@ -3,16 +3,24 @@
  import (
  	"io"
  	"sync"
@@ -396,22 +1085,55 @@
  
  	"github.com/xtls/xray-core/common/buf"
  	"github.com/xtls/xray-core/common/net"
-@@ -30,31 +31,37 @@
+ )
+ 
++// A source socket can send to several destinations. The dispatcher chooses one
++// route per connection, so each source/destination pair needs its own connection.
++// Xray IP addresses are comparable value types, including freshly parsed IPs.
++type udpFlow struct {
++	src, dst net.Destination
++}
++
+ // sub-handler specifically for udp connections under main handler
+ type udpConnectionHandler struct {
+ 	sync.Mutex
+ 
+-	udpConns map[net.Destination]*udpConn
++	udpConns map[udpFlow]*udpConn
+ 
+ 	handleConnection func(conn net.Conn, dest net.Destination)
+ 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
+@@ -20,7 +28,7 @@
+ 
+ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error) *udpConnectionHandler {
+ 	handler := &udpConnectionHandler{
+-		udpConns:         make(map[net.Destination]*udpConn),
++		udpConns:         make(map[udpFlow]*udpConn),
+ 		handleConnection: handleConnection,
+ 		writePacket:      writePacket,
+ 	}
+@@ -29,33 +37,41 @@
+ }
  
  // HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
- // this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
+-// this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
 -func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte) bool {
++// Returning packets may retain their own source through WriteMultiBuffer's UDP
++// metadata. Outgoing destinations must be isolated for correct payload routing.
 +func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte, reject func() error) bool {
  	u.Lock()
- 	conn, found := u.udpConns[src]
+-	conn, found := u.udpConns[src]
++	flow := udpFlow{src: src, dst: dst}
++	conn, found := u.udpConns[flow]
  	if !found {
  		egress := make(chan []byte, 16)
 -		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
+-		u.udpConns[src] = conn
 +		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst, reject: reject}
 +		if dst.Port == 443 && dst.Address.Family().IsIPv4() {
 +			udp443Attempts.Add(1)
 +		}
- 		u.udpConns[src] = conn
++		u.udpConns[flow] = conn
  
  		go u.handleConnection(conn, dst)
  	}
@@ -431,15 +1153,18 @@
  
 -func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
 +func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
-+	src := c.src
++	flow := udpFlow{src: c.src, dst: c.dst}
  	u.Lock()
- 	conn, found := u.udpConns[src]
+-	conn, found := u.udpConns[src]
 -	if found {
+-		delete(u.udpConns, src)
++	conn, found := u.udpConns[flow]
 +	if found && conn == c {
- 		delete(u.udpConns, src)
++		delete(u.udpConns, flow)
  		close(conn.egress)
  	}
-@@ -68,9 +75,11 @@
+ 	u.Unlock()
+@@ -68,9 +84,11 @@
  
  	handler *udpConnectionHandler
  
@@ -454,7 +1179,7 @@
  }
  
  // Read packets from the connection
-@@ -96,7 +105,7 @@
+@@ -96,7 +114,7 @@
  }
  
  func (c *udpConn) Close() error {
@@ -463,7 +1188,17 @@
  
  	return nil
  }
-@@ -132,3 +141,20 @@
+@@ -111,6 +129,9 @@
+ 
+ // Write returning packets back
+ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	// buf.Writer takes ownership. writePacket copies the payload into its own
++	// packet storage before returning, so release even skipped/failed datagrams.
++	defer buf.ReleaseMulti(mb)
+ 	for _, b := range mb {
+ 		dst := c.dst
+ 		if b.UDP != nil {
+@@ -132,3 +153,20 @@
  
  	return nil
  }
@@ -471,7 +1206,7 @@
 +var udp443Attempts, rejectedUDP443 atomic.Int64
 +
 +// UDP443Attempts counts new IPv4 UDP/443 TUN associations for this process.
-+// Full-cone associations are keyed by source address/port, not individual packets.
++// Associations are keyed by source and destination, not individual packets.
 +func UDP443Attempts() int64 { return udp443Attempts.Load() }
 +
 +// RejectedUDP443 counts successfully emitted local IPv4 port-unreachable replies.
@@ -483,6 +1218,84 @@
 +			rejectedUDP443.Add(1)
 +		}
 +	})
++}
+--- /dev/null
++++ b/proxy/tun/udp_fullcone_test.go
+@@ -0,0 +1,75 @@
++package tun
++
++import (
++	"bytes"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++)
++
++func TestUDPDirectTrafficStillReturnsData(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40000)
++	dst := net.UDPDestination(net.ParseAddress("192.168.1.1"), 443)
++	replied := make(chan []byte, 1)
++	refused := false
++	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
++		defer c.Close()
++		b := make([]byte, 64)
++		n, err := c.Read(b)
++		if err == nil {
++			c.Write(b[:n])
++		}
++	}, func(b []byte, from, to net.Destination) error {
++		if from != dst || to != src {
++			t.Error("return direction changed")
++		}
++		replied <- append([]byte(nil), b...)
++		return nil
++	})
++	h.HandlePacket(src, dst, []byte("direct QUIC"), func() error { refused = true; return nil })
++	select {
++	case b := <-replied:
++		if !bytes.Equal(b, []byte("direct QUIC")) {
++			t.Fatal("payload changed")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("no UDP reply")
++	}
++	if refused {
++		t.Fatal("direct traffic refused")
++	}
++}
++
++func TestUDPEarlyRefusalDoesNotRacePacketSendOrReplacement(t *testing.T) {
++	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40001)
++	dst := net.UDPDestination(net.ParseAddress("198.51.100.1"), 443)
++	var done sync.WaitGroup
++	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
++		c.(*udpConn).RejectUDP()
++		c.Close()
++		_, err := c.Read(make([]byte, 32))
++		if err != nil && err != io.EOF {
++			t.Error(err)
++		}
++		done.Done()
++	}, nil)
++	// Each creation adds once under the same handler lock as creation; reject callback
++	// can immediately close while the producer is enqueueing the first datagram.
++	for i := 0; i < 100; i++ {
++		done.Add(1)
++		h.HandlePacket(src, dst, []byte("x"), func() error { return nil })
++		done.Wait()
++	}
++	old := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
++	current := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
++	flow := udpFlow{src: src, dst: dst}
++	h.udpConns[flow] = current
++	old.Close()
++	if h.udpConns[flow] != current {
++		t.Fatal("stale close deleted replacement")
++	}
++	current.Close()
 +}
 --- a/proxy/vless/outbound/outbound.go
 +++ b/proxy/vless/outbound/outbound.go
@@ -586,148 +1399,8 @@
 +	return target.Address.Family().IsDomain() && (target.Address.Domain() == "v1.mux.cool" || target.Address.Domain() == "v1.rvs.cool")
 +}
 --- /dev/null
-+++ b/proxy/tun/udp_fullcone_test.go
-@@ -0,0 +1,74 @@
-+package tun
-+
-+import (
-+	"bytes"
-+	"io"
-+	"sync"
-+	"testing"
-+	"time"
-+
-+	"github.com/xtls/xray-core/common/net"
-+)
-+
-+func TestUDPDirectTrafficStillReturnsData(t *testing.T) {
-+	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40000)
-+	dst := net.UDPDestination(net.ParseAddress("192.168.1.1"), 443)
-+	replied := make(chan []byte, 1)
-+	refused := false
-+	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
-+		defer c.Close()
-+		b := make([]byte, 64)
-+		n, err := c.Read(b)
-+		if err == nil {
-+			c.Write(b[:n])
-+		}
-+	}, func(b []byte, from, to net.Destination) error {
-+		if from != dst || to != src {
-+			t.Error("return direction changed")
-+		}
-+		replied <- append([]byte(nil), b...)
-+		return nil
-+	})
-+	h.HandlePacket(src, dst, []byte("direct QUIC"), func() error { refused = true; return nil })
-+	select {
-+	case b := <-replied:
-+		if !bytes.Equal(b, []byte("direct QUIC")) {
-+			t.Fatal("payload changed")
-+		}
-+	case <-time.After(time.Second):
-+		t.Fatal("no UDP reply")
-+	}
-+	if refused {
-+		t.Fatal("direct traffic refused")
-+	}
-+}
-+
-+func TestUDPEarlyRefusalDoesNotRacePacketSendOrReplacement(t *testing.T) {
-+	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40001)
-+	dst := net.UDPDestination(net.ParseAddress("198.51.100.1"), 443)
-+	var done sync.WaitGroup
-+	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
-+		c.(*udpConn).RejectUDP()
-+		c.Close()
-+		_, err := c.Read(make([]byte, 32))
-+		if err != nil && err != io.EOF {
-+			t.Error(err)
-+		}
-+		done.Done()
-+	}, nil)
-+	// Each creation adds once under the same handler lock as creation; reject callback
-+	// can immediately close while the producer is enqueueing the first datagram.
-+	for i := 0; i < 100; i++ {
-+		done.Add(1)
-+		h.HandlePacket(src, dst, []byte("x"), func() error { return nil })
-+		done.Wait()
-+	}
-+	old := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
-+	current := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
-+	h.udpConns[src] = current
-+	old.Close()
-+	if h.udpConns[src] != current {
-+		t.Fatal("stale close deleted replacement")
-+	}
-+	current.Close()
-+}
---- /dev/null
-+++ b/proxy/vless/outbound/udp_refuse_test.go
-@@ -0,0 +1,60 @@
-+package outbound
-+
-+import (
-+	"context"
-+	"testing"
-+
-+	"github.com/xtls/xray-core/common/net"
-+	"github.com/xtls/xray-core/common/protocol"
-+	"github.com/xtls/xray-core/common/session"
-+	"github.com/xtls/xray-core/proxy/vless"
-+	"github.com/xtls/xray-core/transport"
-+	"github.com/xtls/xray-core/transport/internet/stat"
-+)
-+
-+// Stop at the dial boundary without network access or waiting through retries.
-+type dialBoundary struct{}
-+
-+func (dialBoundary) Dial(context.Context, net.Destination) (stat.Connection, error) {
-+	panic(dialBoundary{})
-+}
-+func (dialBoundary) DestIpAddress() net.IP                                 { return nil }
-+func (dialBoundary) SetOutboundGateway(context.Context, *session.Outbound) {}
-+
-+func TestUDPRefusalOnlyForUnsupportedVisionUDP443(t *testing.T) {
-+	for _, c := range []struct {
-+		name, flow string
-+		target     net.Destination
-+		reject     bool
-+	}{
-+		{"vision443", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), true},
-+		{"visionDomain443", vless.XRV, net.UDPDestination(net.DomainAddress("instagram.com"), 443), true},
-+		{"enabled443", vless.XRV + "-udp443", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
-+		{"plain443", "", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
-+		{"dns", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 53), false},
-+		{"tcp", vless.XRV, net.TCPDestination(net.ParseAddress("198.51.100.10"), 443), false},
-+		{"mux", vless.XRV, net.UDPDestination(net.DomainAddress("v1.mux.cool"), 443), false},
-+	} {
-+		t.Run(c.name, func(t *testing.T) {
-+			h := &Handler{server: &protocol.ServerSpec{User: &protocol.MemoryUser{Account: &vless.MemoryAccount{Flow: c.flow}}}}
-+			ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: c.target}})
-+			refused := false
-+			ctx = session.ContextWithUDPReject(ctx, func() { refused = true })
-+			dialed := false
-+			func() {
-+				defer func() {
-+					if p := recover(); p != nil {
-+						if _, ok := p.(dialBoundary); !ok {
-+							panic(p)
-+						}
-+						dialed = true
-+					}
-+				}()
-+				h.Process(ctx, &transport.Link{}, dialBoundary{})
-+			}()
-+			if refused != c.reject || dialed == c.reject {
-+				t.Fatalf("refused=%v dialed=%v, want refusal=%v", refused, dialed, c.reject)
-+			}
-+		})
-+	}
-+}
---- /dev/null
 +++ b/proxy/vless/outbound/preconnect.go
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,208 @@
 +package outbound
 +
 +import (
@@ -896,6 +1569,11 @@
 +}
 +
 +func (h *Handler) takePreconnect(ctx context.Context, dialer internet.Dialer) stat.Connection {
++	// Health checks must test a new connection without stealing a warm app spare
++	// or manufacturing app demand that would refill an otherwise idle reserve.
++	if session.IsPreconnectDisabled(ctx) {
++		return nil
++	}
 +	h.preMu.Lock()
 +	if h.preClosed {
 +		h.preMu.Unlock()
@@ -933,17 +1611,24 @@
 +}
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect_test.go
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,243 @@
 +package outbound
 +
 +import (
 +	"context"
 +	"errors"
-+	"github.com/xtls/xray-core/transport/internet/stat"
 +	"net"
++	"strings"
 +	"sync/atomic"
 +	"testing"
 +	"time"
++
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet/stat"
 +)
 +
 +type trackedConn struct {
@@ -1094,44 +1779,177 @@
 +		t.Fatal("reserve discard did not close raw TLS transport directly")
 +	}
 +}
---- a/transport/internet/reality/reality.go
-+++ b/transport/internet/reality/reality.go
-@@ -27,6 +27,7 @@
- 	"github.com/xtls/xray-core/common/crypto"
- 	"github.com/xtls/xray-core/common/errors"
- 	"github.com/xtls/xray-core/common/net"
++
++type reservePolicyDialer struct {
++	fresh, health, reserve atomic.Int32
++}
++
++func (d *reservePolicyDialer) Dial(ctx context.Context, _ xnet.Destination) (stat.Connection, error) {
++	if session.IsPreconnect(ctx) {
++		d.reserve.Add(1)
++	} else {
++		d.fresh.Add(1)
++		if session.IsPreconnectDisabled(ctx) {
++			d.health.Add(1)
++		}
++	}
++	// Stop Process after its connection choice at Vision's TLS type check. This
++	// isolates the real reserve/dial decision without network traffic or retries.
++	return &trackedConn{}, nil
++}
++func (*reservePolicyDialer) DestIpAddress() xnet.IP                                { return nil }
++func (*reservePolicyDialer) SetOutboundGateway(context.Context, *session.Outbound) {}
++
++func TestHealthDialLeavesColdAndWarmAppReservesUntouched(t *testing.T) {
++	h := &Handler{testpre: 2, server: &protocol.ServerSpec{
++		Destination: xnet.TCPDestination(xnet.ParseAddress("198.51.100.1"), 2083),
++		User:        &protocol.MemoryUser{Account: &vless.MemoryAccount{Flow: vless.XRV}},
++	}}
++	defer h.Close()
++	d := &reservePolicyDialer{}
++	process := func(health bool) {
++		t.Helper()
++		ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
++			Target: xnet.TCPDestination(xnet.DomainAddress("www.youtube.com"), 443),
++		}})
++		if health {
++			ctx = session.ContextWithPreconnectDisabled(ctx)
++		}
++		if err := h.Process(ctx, &transport.Link{}, d); err == nil || !strings.Contains(err.Error(), "XTLS only supports TLS and REALITY") {
++			t.Fatalf("did not stop at the expected post-dial Vision boundary: %v", err)
++		}
++	}
++
++	process(true)
++	if d.fresh.Load() != 1 || d.health.Load() != 1 || d.reserve.Load() != 0 || h.prePool != nil {
++		t.Fatalf("cold health call warmed reserve: fresh=%d health=%d reserve=%d pool=%v", d.fresh.Load(), d.health.Load(), d.reserve.Load(), h.prePool != nil)
++	}
++
++	// Ordinary app demand still creates its two bounded spares.
++	process(false)
++	p := h.prePool
++	if p == nil {
++		t.Fatal("app demand did not initialize its reserve")
++	}
++	eventually(t, func() bool { return readyCount(p) == 2 })
++	if d.fresh.Load() != 2 || d.reserve.Load() != 2 {
++		t.Fatalf("unexpected app demand dials: fresh=%d reserve=%d", d.fresh.Load(), d.reserve.Load())
++	}
++	p.mu.Lock()
++	first, second := p.ready[0], p.ready[1]
++	p.mu.Unlock()
++	hits, misses := PreconnectHits(), PreconnectMisses()
++
++	process(true)
++	p.mu.Lock()
++	untouched := len(p.ready) == 2 && p.ready[0] == first && p.ready[1] == second && p.inFlight == 0
++	p.mu.Unlock()
++	if !untouched || d.fresh.Load() != 3 || d.health.Load() != 2 || d.reserve.Load() != 2 || PreconnectHits() != hits || PreconnectMisses() != misses {
++		t.Fatal("warm health call consumed/refilled app reserves or entered their metrics")
++	}
++
++	// The next actual app request takes the original first spare, then refills.
++	process(false)
++	eventually(t, func() bool { return readyCount(p) == 2 })
++	if PreconnectHits() != hits+1 || d.fresh.Load() != 3 || d.reserve.Load() != 3 || first.conn.(*trackedConn).closed.Load() != 1 || second.conn.(*trackedConn).closed.Load() != 0 {
++		t.Fatal("app reserve ownership/refill changed after health call")
++	}
++}
+--- /dev/null
++++ b/proxy/vless/outbound/udp_refuse_test.go
+@@ -0,0 +1,60 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
 +	"github.com/xtls/xray-core/common/session"
- 	"github.com/xtls/xray-core/common/utils"
- 	"github.com/xtls/xray-core/core"
- 	"github.com/xtls/xray-core/transport/internet/tls"
-@@ -114,7 +115,16 @@
- 	return nil
++	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++// Stop at the dial boundary without network access or waiting through retries.
++type dialBoundary struct{}
++
++func (dialBoundary) Dial(context.Context, net.Destination) (stat.Connection, error) {
++	panic(dialBoundary{})
++}
++func (dialBoundary) DestIpAddress() net.IP                                 { return nil }
++func (dialBoundary) SetOutboundGateway(context.Context, *session.Outbound) {}
++
++func TestUDPRefusalOnlyForUnsupportedVisionUDP443(t *testing.T) {
++	for _, c := range []struct {
++		name, flow string
++		target     net.Destination
++		reject     bool
++	}{
++		{"vision443", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), true},
++		{"visionDomain443", vless.XRV, net.UDPDestination(net.DomainAddress("instagram.com"), 443), true},
++		{"enabled443", vless.XRV + "-udp443", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"plain443", "", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"dns", vless.XRV, net.UDPDestination(net.ParseAddress("198.51.100.10"), 53), false},
++		{"tcp", vless.XRV, net.TCPDestination(net.ParseAddress("198.51.100.10"), 443), false},
++		{"mux", vless.XRV, net.UDPDestination(net.DomainAddress("v1.mux.cool"), 443), false},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			h := &Handler{server: &protocol.ServerSpec{User: &protocol.MemoryUser{Account: &vless.MemoryAccount{Flow: c.flow}}}}
++			ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: c.target}})
++			refused := false
++			ctx = session.ContextWithUDPReject(ctx, func() { refused = true })
++			dialed := false
++			func() {
++				defer func() {
++					if p := recover(); p != nil {
++						if _, ok := p.(dialBoundary); !ok {
++							panic(p)
++						}
++						dialed = true
++					}
++				}()
++				h.Process(ctx, &transport.Link{}, dialBoundary{})
++			}()
++			if refused != c.reject || dialed == c.reject {
++				t.Fatalf("refused=%v dialed=%v, want refusal=%v", refused, dialed, c.reject)
++			}
++		})
++	}
++}
+--- a/proxy/wireguard/tun_linux.go
++++ b/proxy/wireguard/tun_linux.go
+@@ -10,10 +10,10 @@
+ 	"net/netip"
+ 	"os"
+ 	"sync"
++	"syscall"
+ 
+ 	"golang.org/x/sys/unix"
+ 
+-	"github.com/sagernet/sing/common/control"
+ 	"github.com/vishvananda/netlink"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	wgtun "golang.zx2c4.com/wireguard/tun"
+@@ -48,8 +48,15 @@
+ 
+ func newDeviceNet(interfaceName string) *deviceNet {
+ 	var dialer net.Dialer
+-	bindControl := control.BindToInterface(control.NewDefaultInterfaceFinder(), interfaceName, -1)
+-	dialer.Control = control.Append(dialer.Control, bindControl)
++	dialer.Control = func(network, address string, conn syscall.RawConn) error {
++		var bindErr error
++		if err := conn.Control(func(fd uintptr) {
++			bindErr = unix.BindToDevice(int(fd), interfaceName)
++		}); err != nil {
++			return err
++		}
++		return bindErr
++	}
+ 	return &deviceNet{dialer: dialer}
  }
  
--func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
-+func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (result net.Conn, resultErr error) {
-+	// Reserve dials own their raw socket until authentication succeeds. Unlike a
-+	// user-requested dial, failure must not create unbounded camouflage traffic.
-+	if session.IsPreconnect(ctx) {
-+		defer func() {
-+			if resultErr != nil {
-+				c.Close()
-+			}
-+		}()
-+	}
- 	localAddr := c.LocalAddr().String()
- 	uConn := &UConn{
- 		Config: config,
-@@ -181,6 +191,9 @@
- 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
- 	}
- 	if !uConn.Verified {
-+		if session.IsPreconnect(ctx) {
-+			return nil, errors.New("REALITY: reserve authentication failed").AtWarning()
-+		}
- 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
- 		go func() {
- 			client := &http.Client{
 --- /dev/null
 +++ b/transport/internet/reality/preconnect_test.go
 @@ -0,0 +1,41 @@
@@ -1176,3 +1994,125 @@
 +		right.Close()
 +	}
 +}
+--- a/transport/internet/reality/reality.go
++++ b/transport/internet/reality/reality.go
+@@ -27,6 +27,7 @@
+ 	"github.com/xtls/xray-core/common/crypto"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/utils"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+@@ -114,7 +115,16 @@
+ 	return nil
+ }
+ 
+-func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
++func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (result net.Conn, resultErr error) {
++	// Reserve dials own their raw socket until authentication succeeds. Unlike a
++	// user-requested dial, failure must not create unbounded camouflage traffic.
++	if session.IsPreconnect(ctx) {
++		defer func() {
++			if resultErr != nil {
++				c.Close()
++			}
++		}()
++	}
+ 	localAddr := c.LocalAddr().String()
+ 	uConn := &UConn{
+ 		Config: config,
+@@ -181,6 +191,9 @@
+ 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
+ 	}
+ 	if !uConn.Verified {
++		if session.IsPreconnect(ctx) {
++			return nil, errors.New("REALITY: reserve authentication failed").AtWarning()
++		}
+ 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
+ 		go func() {
+ 			client := &http.Client{
+--- a/transport/internet/system_dialer.go
++++ b/transport/internet/system_dialer.go
+@@ -5,7 +5,6 @@
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/sagernet/sing/common/control"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/features/dns"
+@@ -20,7 +19,7 @@
+ }
+ 
+ type DefaultSystemDialer struct {
+-	controllers []control.Func
++	controllers []ControlFunc
+ 	dns         dns.Client
+ 	obm         outbound.Manager
+ }
+@@ -204,7 +203,10 @@
+ // It only works when effective dialer is the default dialer.
+ //
+ // xray:api:beta
+-func RegisterDialerController(ctl control.Func) error {
++// ControlFunc is a socket hook with the same shape as net.Dialer.Control.
++type ControlFunc = func(network, address string, conn syscall.RawConn) error
++
++func RegisterDialerController(ctl ControlFunc) error {
+ 	if ctl == nil {
+ 		return errors.New("nil listener controller")
+ 	}
+--- a/transport/internet/system_listener.go
++++ b/transport/internet/system_listener.go
+@@ -10,7 +10,6 @@
+ 	"time"
+ 
+ 	"github.com/pires/go-proxyproto"
+-	"github.com/sagernet/sing/common/control"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+ )
+@@ -18,10 +17,10 @@
+ var effectiveListener = DefaultListener{}
+ 
+ type DefaultListener struct {
+-	controllers []control.Func
++	controllers []ControlFunc
+ }
+ 
+-func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []control.Func) func(network, address string, c syscall.RawConn) error {
++func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []ControlFunc) func(network, address string, c syscall.RawConn) error {
+ 	return func(network, address string, c syscall.RawConn) error {
+ 		return c.Control(func(fd uintptr) {
+ 			for _, controller := range controllers {
+@@ -186,7 +185,7 @@
+ // The controller can be used to operate on file descriptors before they are put into use.
+ //
+ // xray:api:beta
+-func RegisterListenerController(controller control.Func) error {
++func RegisterListenerController(controller ControlFunc) error {
+ 	if controller == nil {
+ 		return errors.New("nil listener controller")
+ 	}
+--- a/transport/internet/system_listener_test.go
++++ b/transport/internet/system_listener_test.go
+@@ -6,7 +6,6 @@
+ 	"syscall"
+ 	"testing"
+ 
+-	"github.com/sagernet/sing/common/control"
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/transport/internet"
+ )
+@@ -15,9 +14,8 @@
+ 	var gotFd uintptr
+ 
+ 	common.Must(internet.RegisterListenerController(func(network, address string, conn syscall.RawConn) error {
+-		return control.Raw(conn, func(fd uintptr) error {
++		return conn.Control(func(fd uintptr) {
+ 			gotFd = fd
+-			return nil
+ 		})
+ 	}))
+ 

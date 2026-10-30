@@ -9,11 +9,18 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
+// A source socket can send to several destinations. The dispatcher chooses one
+// route per connection, so each source/destination pair needs its own connection.
+// Xray IP addresses are comparable value types, including freshly parsed IPs.
+type udpFlow struct {
+	src, dst net.Destination
+}
+
 // sub-handler specifically for udp connections under main handler
 type udpConnectionHandler struct {
 	sync.Mutex
 
-	udpConns map[net.Destination]*udpConn
+	udpConns map[udpFlow]*udpConn
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -21,7 +28,7 @@ type udpConnectionHandler struct {
 
 func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error) *udpConnectionHandler {
 	handler := &udpConnectionHandler{
-		udpConns:         make(map[net.Destination]*udpConn),
+		udpConns:         make(map[udpFlow]*udpConn),
 		handleConnection: handleConnection,
 		writePacket:      writePacket,
 	}
@@ -30,17 +37,19 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 }
 
 // HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
-// this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
+// Returning packets may retain their own source through WriteMultiBuffer's UDP
+// metadata. Outgoing destinations must be isolated for correct payload routing.
 func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte, reject func() error) bool {
 	u.Lock()
-	conn, found := u.udpConns[src]
+	flow := udpFlow{src: src, dst: dst}
+	conn, found := u.udpConns[flow]
 	if !found {
 		egress := make(chan []byte, 16)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst, reject: reject}
 		if dst.Port == 443 && dst.Address.Family().IsIPv4() {
 			udp443Attempts.Add(1)
 		}
-		u.udpConns[src] = conn
+		u.udpConns[flow] = conn
 
 		go u.handleConnection(conn, dst)
 	}
@@ -58,11 +67,11 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 }
 
 func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
-	src := c.src
+	flow := udpFlow{src: c.src, dst: c.dst}
 	u.Lock()
-	conn, found := u.udpConns[src]
+	conn, found := u.udpConns[flow]
 	if found && conn == c {
-		delete(u.udpConns, src)
+		delete(u.udpConns, flow)
 		close(conn.egress)
 	}
 	u.Unlock()
@@ -120,6 +129,9 @@ func (c *udpConn) RemoteAddr() net.Addr {
 
 // Write returning packets back
 func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	// buf.Writer takes ownership. writePacket copies the payload into its own
+	// packet storage before returning, so release even skipped/failed datagrams.
+	defer buf.ReleaseMulti(mb)
 	for _, b := range mb {
 		dst := c.dst
 		if b.UDP != nil {
@@ -145,7 +157,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 var udp443Attempts, rejectedUDP443 atomic.Int64
 
 // UDP443Attempts counts new IPv4 UDP/443 TUN associations for this process.
-// Full-cone associations are keyed by source address/port, not individual packets.
+// Associations are keyed by source and destination, not individual packets.
 func UDP443Attempts() int64 { return udp443Attempts.Load() }
 
 // RejectedUDP443 counts successfully emitted local IPv4 port-unreachable replies.

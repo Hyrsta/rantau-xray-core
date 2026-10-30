@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -70,27 +71,46 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 	errors.LogInfo(t.ctx, tunName, " created")
 
-	tunStackOptions := StackOptions{
-		Tun:         tunInterface,
-		IdleTimeout: pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
+	refuseIPv6, _ := ctx.Value(ipv6RefusalKey{}).(bool)
+	startup, _ := ctx.Value(deferredStartupKey{}).(*deferredStartupState)
+	var tunStack Stack
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if tunStack != nil {
+				_ = tunStack.Close()
+			}
+			if startup != nil && startup.cleanup != nil {
+				startup.cleanup(tunInterface)
+			} else {
+				_ = tunInterface.Close()
+			}
+		})
 	}
-	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
+	if startup != nil {
+		startup.add(cleanup)
+	}
+	tunStackOptions := StackOptions{
+		Tun:             tunInterface,
+		IdleTimeout:     pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
+		RefuseIPv6:      refuseIPv6,
+		DeferredStartup: startup != nil,
+	}
+	tunStack, err = NewStack(t.ctx, tunStackOptions, t)
 	if err != nil {
-		_ = tunInterface.Close()
+		cleanup()
 		return err
 	}
 
 	err = tunStack.Start()
 	if err != nil {
-		_ = tunStack.Close()
-		_ = tunInterface.Close()
+		cleanup()
 		return err
 	}
 
 	err = tunInterface.Start()
 	if err != nil {
-		_ = tunStack.Close()
-		_ = tunInterface.Close()
+		cleanup()
 		return err
 	}
 
@@ -168,4 +188,10 @@ func init() {
 		})
 		return t, err
 	}))
+}
+
+// Activate starts packet reads for an instance created with WithDeferredStartup.
+// Call only after the core instance and its outbounds have started.
+func (t *Handler) Activate() error {
+	return t.stack.(interface{ Activate() error }).Activate()
 }

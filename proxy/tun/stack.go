@@ -12,6 +12,8 @@ type Stack interface {
 
 // StackOptions for the stack implementation
 type StackOptions struct {
-	Tun         Tun
-	IdleTimeout time.Duration
+	Tun             Tun
+	IdleTimeout     time.Duration
+	RefuseIPv6      bool
+	DeferredStartup bool
 }

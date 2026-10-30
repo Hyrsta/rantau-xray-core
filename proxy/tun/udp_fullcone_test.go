@@ -63,11 +63,12 @@ func TestUDPEarlyRefusalDoesNotRacePacketSendOrReplacement(t *testing.T) {
 		h.HandlePacket(src, dst, []byte("x"), func() error { return nil })
 		done.Wait()
 	}
-	old := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
-	current := &udpConn{handler: h, src: src, egress: make(chan []byte, 1)}
-	h.udpConns[src] = current
+	old := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
+	current := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
+	flow := udpFlow{src: src, dst: dst}
+	h.udpConns[flow] = current
 	old.Close()
-	if h.udpConns[src] != current {
+	if h.udpConns[flow] != current {
 		t.Fatal("stale close deleted replacement")
 	}
 	current.Close()

@@ -1,8 +1,10 @@
 # Xray-core as built into Rantau VPN
 
 This is the source of Xray-core [v26.3.27](https://github.com/XTLS/Xray-core/tree/v26.3.27) (Go module
-version v1.260327.0) exactly as it is built into the Rantau VPN apps for Android, macOS and Windows. It is
-published under Xray-core's own licence, the Mozilla Public License 2.0 ([LICENSE](LICENSE)).
+version v1.260327.0) used by Rantau VPN. Tag `v26.3.27-rantau.3` supplies the exact vendored
+source for Android 0.1.28. Earlier Android, macOS and Windows releases retain their respective
+source tags. This source is published under Xray-core's own licence, the Mozilla Public License
+2.0 ([LICENSE](LICENSE)).
 
 ## What differs from the original
 
@@ -37,8 +39,27 @@ what they do.
 - Add aggregate transport counters and regression tests for routing-independent refusal,
   concurrency, reserve ownership, cancellation, expiry and cleanup.
 
-This tag supplies the changed Xray files for Rantau VPN Android 0.1.27. Earlier apps retain their
-original source tag. The complete file set is mirrored from the vendored source used in that build.
+## Android 0.1.28 transport changes (v26.3.27-rantau.3)
+
+This revision retains all changes in `v26.3.27-rantau.2` and adds:
+
+- Give each UDP source/destination pair its own association and routing decision, and preserve
+  reply source metadata. Refusing one unsupported destination no longer closes another flow
+  from the same application socket.
+- Release owned UDP buffers after packet construction, including discarded packets and write
+  failures. The packet stack copies their contents before release, restoring buffer-pool reuse.
+- Activate TUN packet reads only after handlers are ready, with an explicit deferred-start hook
+  for callers that also wait for the core and outbounds. Keep IPv6 refusal instance-local and
+  make failed-construction cleanup idempotent while preserving the caller's VPN descriptor.
+- Add a dedicated context marker so health-check connections bypass application reserve lookup
+  and refill. This marker is separate from speculative REALITY authentication control; normal
+  application reserve and transport authentication behavior are retained.
+- Add regression coverage for destination isolation, reply metadata, buffer ownership, startup
+  ordering, failure cleanup, and cold/warm reserve isolation.
+
+The complete source file set is mirrored from the vendored source used in Android 0.1.28.
+These are correctness and resource-ownership changes; this source tag makes no application-speed
+or network-performance claim.
 
 Other than these changes and the removals listed above, the source matches the original release. The original's `.github` folder (its build, Docker,
 Dependabot and issue settings) is not part of the apps and is left out here.

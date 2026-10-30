@@ -3,11 +3,18 @@ package outbound
 import (
 	"context"
 	"errors"
-	"github.com/xtls/xray-core/transport/internet/stat"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type trackedConn struct {
@@ -156,5 +163,81 @@ func TestPreconnectDiscardClosesRawTLSWithoutGracefulWait(t *testing.T) {
 	}
 	if conn.gracefulCalls.Load() != 0 || conn.closed.Load() != 1 {
 		t.Fatal("reserve discard did not close raw TLS transport directly")
+	}
+}
+
+type reservePolicyDialer struct {
+	fresh, health, reserve atomic.Int32
+}
+
+func (d *reservePolicyDialer) Dial(ctx context.Context, _ xnet.Destination) (stat.Connection, error) {
+	if session.IsPreconnect(ctx) {
+		d.reserve.Add(1)
+	} else {
+		d.fresh.Add(1)
+		if session.IsPreconnectDisabled(ctx) {
+			d.health.Add(1)
+		}
+	}
+	// Stop Process after its connection choice at Vision's TLS type check. This
+	// isolates the real reserve/dial decision without network traffic or retries.
+	return &trackedConn{}, nil
+}
+func (*reservePolicyDialer) DestIpAddress() xnet.IP                                { return nil }
+func (*reservePolicyDialer) SetOutboundGateway(context.Context, *session.Outbound) {}
+
+func TestHealthDialLeavesColdAndWarmAppReservesUntouched(t *testing.T) {
+	h := &Handler{testpre: 2, server: &protocol.ServerSpec{
+		Destination: xnet.TCPDestination(xnet.ParseAddress("198.51.100.1"), 2083),
+		User:        &protocol.MemoryUser{Account: &vless.MemoryAccount{Flow: vless.XRV}},
+	}}
+	defer h.Close()
+	d := &reservePolicyDialer{}
+	process := func(health bool) {
+		t.Helper()
+		ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+			Target: xnet.TCPDestination(xnet.DomainAddress("www.youtube.com"), 443),
+		}})
+		if health {
+			ctx = session.ContextWithPreconnectDisabled(ctx)
+		}
+		if err := h.Process(ctx, &transport.Link{}, d); err == nil || !strings.Contains(err.Error(), "XTLS only supports TLS and REALITY") {
+			t.Fatalf("did not stop at the expected post-dial Vision boundary: %v", err)
+		}
+	}
+
+	process(true)
+	if d.fresh.Load() != 1 || d.health.Load() != 1 || d.reserve.Load() != 0 || h.prePool != nil {
+		t.Fatalf("cold health call warmed reserve: fresh=%d health=%d reserve=%d pool=%v", d.fresh.Load(), d.health.Load(), d.reserve.Load(), h.prePool != nil)
+	}
+
+	// Ordinary app demand still creates its two bounded spares.
+	process(false)
+	p := h.prePool
+	if p == nil {
+		t.Fatal("app demand did not initialize its reserve")
+	}
+	eventually(t, func() bool { return readyCount(p) == 2 })
+	if d.fresh.Load() != 2 || d.reserve.Load() != 2 {
+		t.Fatalf("unexpected app demand dials: fresh=%d reserve=%d", d.fresh.Load(), d.reserve.Load())
+	}
+	p.mu.Lock()
+	first, second := p.ready[0], p.ready[1]
+	p.mu.Unlock()
+	hits, misses := PreconnectHits(), PreconnectMisses()
+
+	process(true)
+	p.mu.Lock()
+	untouched := len(p.ready) == 2 && p.ready[0] == first && p.ready[1] == second && p.inFlight == 0
+	p.mu.Unlock()
+	if !untouched || d.fresh.Load() != 3 || d.health.Load() != 2 || d.reserve.Load() != 2 || PreconnectHits() != hits || PreconnectMisses() != misses {
+		t.Fatal("warm health call consumed/refilled app reserves or entered their metrics")
+	}
+
+	// The next actual app request takes the original first spare, then refills.
+	process(false)
+	eventually(t, func() bool { return readyCount(p) == 2 })
+	if PreconnectHits() != hits+1 || d.fresh.Load() != 3 || d.reserve.Load() != 3 || first.conn.(*trackedConn).closed.Load() != 1 || second.conn.(*trackedConn).closed.Load() != 0 {
+		t.Fatal("app reserve ownership/refill changed after health call")
 	}
 }

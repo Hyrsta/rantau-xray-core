@@ -166,6 +166,11 @@ func (p *preconnectPool) Close() {
 }
 
 func (h *Handler) takePreconnect(ctx context.Context, dialer internet.Dialer) stat.Connection {
+	// Health checks must test a new connection without stealing a warm app spare
+	// or manufacturing app demand that would refill an otherwise idle reserve.
+	if session.IsPreconnectDisabled(ctx) {
+		return nil
+	}
 	h.preMu.Lock()
 	if h.preClosed {
 		h.preMu.Unlock()
