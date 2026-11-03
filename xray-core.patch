@@ -12,6 +12,91 @@
  	return nil
  }
  
+@@ -383,15 +388,28 @@
+ 		return dns.ErrEmptyResponse
+ 	}
+ 
+-	var noRNF error
++	var noRNF, last error
++	disagree := false
+ 	for _, err := range errs {
+ 		if go_errors.Is(err, errRecordNotFound) {
+ 			continue // server no response, ignore
+-		} else if noRNF == nil {
++		}
++		last = err
++		if noRNF == nil {
+ 			noRNF = err
+ 		} else if !go_errors.Is(err, noRNF) {
++			disagree = true
++		}
++	}
++	if disagree {
++		// The servers disagree, for example an answer that expectedIPs set aside (empty) and "no such name" from the
++		// next server. Combined, the errors carry no DNS code, so the DNS outbound would answer nothing and the client
++		// would wait out its timeout on every try. The last server that answered decides; when it gave no DNS
++		// answer either, nothing is answered, as before.
++		if dns.RCodeFromError(last) == 0 && !go_errors.Is(last, dns.ErrEmptyResponse) {
+ 			return errors.New("returning nil for domain ", domain).Base(errors.Combine(errs...))
+ 		}
++		noRNF = last
+ 	}
+ 	if go_errors.Is(noRNF, dns.ErrEmptyResponse) {
+ 		return dns.ErrEmptyResponse
+--- /dev/null
++++ b/app/dns/merge_errors_test.go
+@@ -0,0 +1,51 @@
++package dns
++
++import (
++	go_errors "errors"
++	"testing"
++
++	"github.com/xtls/xray-core/common/errors"
++	feature_dns "github.com/xtls/xray-core/features/dns"
++)
++
++// When the servers disagree, the last one that answered decides, so the DNS outbound can still answer the client.
++// Before, any disagreement gave a combined error with no DNS code, and the client got no answer at all.
++func TestMergeQueryErrorsKeepsAnAnswer(t *testing.T) {
++	empty := feature_dns.ErrEmptyResponse
++	nxdomain, servfail := feature_dns.RCodeError(3), feature_dns.RCodeError(2)
++	other := errors.New("dial failed")
++	for _, tc := range []struct {
++		name      string
++		errs      []error
++		rcode     uint16
++		wantEmpty bool
++	}{
++		{"set aside, then no such name", []error{empty, nxdomain, nxdomain}, 3, false},
++		{"set aside, no such name, no response", []error{empty, nxdomain, errRecordNotFound}, 3, false},
++		{"server failure, then no such name", []error{servfail, nxdomain}, 3, false},
++		{"set aside, then server failure", []error{empty, servfail}, 2, false},
++		{"no such name, then no address", []error{nxdomain, empty}, 0, true},
++		// As before.
++		{"all no such name", []error{nxdomain, nxdomain}, 3, false},
++		{"no response, then no such name", []error{errRecordNotFound, nxdomain}, 3, false},
++		{"set aside, then no response", []error{empty, errRecordNotFound}, 0, true},
++		{"none", nil, 0, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			err := mergeQueryErrors("a.example", tc.errs)
++			if got := feature_dns.RCodeFromError(err); got != tc.rcode {
++				t.Errorf("rcode %d, want %d (%v)", got, tc.rcode, err)
++			}
++			if got := go_errors.Is(err, empty); got != tc.wantEmpty {
++				t.Errorf("empty %v, want %v (%v)", got, tc.wantEmpty, err)
++			}
++		})
++	}
++	// Nothing to answer with: no response at all, or the last server failed without a DNS answer.
++	for _, errs := range [][]error{{errRecordNotFound}, {empty, other}, {nxdomain, other}} {
++		err := mergeQueryErrors("a.example", errs)
++		if feature_dns.RCodeFromError(err) != 0 || go_errors.Is(err, empty) {
++			t.Errorf("%v: got an answer, %v", errs, err)
++		}
++	}
++}
 --- /dev/null
 +++ b/app/dns/nameserver_close_test.go
 @@ -0,0 +1,72 @@
@@ -190,6 +275,136 @@
 +	case <-child.Done():
 +	default:
 +		t.Fatal("health marker detached request cancellation")
++	}
++}
+--- a/proxy/blackhole/blackhole.go
++++ b/proxy/blackhole/blackhole.go
+@@ -5,6 +5,7 @@
+ 	"bytes"
+ 	"context"
+ 	"net/http"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common"
+@@ -21,6 +22,9 @@
+ // Handler is an outbound connection that silently swallow the entire payload.
+ type Handler struct {
+ 	response []byte
++	// closed ends the UDP flows' waits when the instance closes
++	closed    chan struct{}
++	closeOnce sync.Once
+ }
+ 
+ var http403response = http.Response{
+@@ -51,6 +55,7 @@
+ 	}
+ 	return &Handler{
+ 		response: response,
++		closed:   make(chan struct{}),
+ 	}, nil
+ }
+ 
+@@ -75,9 +80,21 @@
+ 		timer := signal.CancelAfterInactivity(ctx, func() {
+ 			cancel()
+ 		}, time.Duration(30+dice.Roll(61))*time.Second)
++		// The timer's check holds the flow's context, and the instance with it, until it fires: end it with the wait
++		defer timer.SetTimeout(0)
+ 		go buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
+-		<-ctx.Done()
++		select {
++		case <-ctx.Done():
++		case <-h.closed:
++		}
+ 	}
++	return nil
++}
++
++// Close implements common.Closable. It ends the blocked UDP flows' waits at once: an embedder that restarts the
++// instance in its process (Android reconnects) would otherwise keep each closed instance for up to 90 s
++func (h *Handler) Close() error {
++	h.closeOnce.Do(func() { close(h.closed) })
+ 	return nil
+ }
+ 
+--- /dev/null
++++ b/proxy/blackhole/blackhole_close_test.go
+@@ -0,0 +1,76 @@
++package blackhole_test
++
++import (
++	"context"
++	"runtime"
++	"testing"
++	"time"
++	"weak"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/proxy/blackhole"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/pipe"
++)
++
++type heldKey struct{}
++
++type held struct{ _ [1 << 16]byte }
++
++// blockUDP starts a blocked UDP flow (multicast DNS, say) and returns what Process returned, and a weak pointer to
++// a value only the flow's context holds.
++func blockUDP(t *testing.T, handler *blackhole.Handler) (<-chan error, weak.Pointer[held]) {
++	t.Helper()
++	value := &held{}
++	alive := weak.Make(value)
++	ctx := context.WithValue(context.Background(), heldKey{}, value)
++	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: net.UDPDestination(net.IPAddress([]byte{224, 0, 0, 251}), 5353)}})
++	reader, writer := pipe.New(pipe.WithoutSizeLimit())
++	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("query"))}); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { done <- handler.Process(ctx, &transport.Link{Reader: reader, Writer: writer}, nil) }()
++	return done, alive
++}
++
++// Closing the instance ends every blocked UDP flow at once. A flow waits 30 to 90 s of inactivity to swallow what
++// else comes, and closing did not end that wait: on Android, which restarts the instance in its process on every
++// reconnect and server move, each blocked UDP flow open at the stop (multicast or LAN discovery into the tunnel)
++// kept the closed instance, about 7 MB, until then.
++func TestCloseEndsBlockedUDPFlows(t *testing.T) {
++	handler, err := blackhole.New(context.Background(), &blackhole.Config{})
++	common.Must(err)
++	done, alive := blockUDP(t, handler)
++	select {
++	case <-done:
++		t.Fatal("a blocked UDP flow ended while the handler was open")
++	case <-time.After(200 * time.Millisecond):
++	}
++
++	common.Must(common.Close(handler))
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("the blocked UDP flow outlived the closed handler")
++	}
++	// Nothing holds the ended flow's context either: the inactivity timer kept it, and through it the instance,
++	// until the timer fired
++	for deadline := time.Now().Add(2 * time.Second); alive.Value() != nil; time.Sleep(10 * time.Millisecond) {
++		if time.Now().After(deadline) {
++			t.Fatal("the ended flow's context is still held")
++		}
++		runtime.GC()
++	}
++
++	// A flow that opens during the stop ends at once too
++	late, _ := blockUDP(t, handler)
++	select {
++	case <-late:
++	case <-time.After(time.Second):
++		t.Fatal("a blocked UDP flow opened after the close kept waiting")
 +	}
 +}
 --- a/proxy/tun/handler.go

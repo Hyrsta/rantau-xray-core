@@ -388,15 +388,28 @@ func mergeQueryErrors(domain string, errs []error) error {
 		return dns.ErrEmptyResponse
 	}
 
-	var noRNF error
+	var noRNF, last error
+	disagree := false
 	for _, err := range errs {
 		if go_errors.Is(err, errRecordNotFound) {
 			continue // server no response, ignore
-		} else if noRNF == nil {
+		}
+		last = err
+		if noRNF == nil {
 			noRNF = err
 		} else if !go_errors.Is(err, noRNF) {
+			disagree = true
+		}
+	}
+	if disagree {
+		// The servers disagree, for example an answer that expectedIPs set aside (empty) and "no such name" from the
+		// next server. Combined, the errors carry no DNS code, so the DNS outbound would answer nothing and the client
+		// would wait out its timeout on every try. The last server that answered decides; when it gave no DNS
+		// answer either, nothing is answered, as before.
+		if dns.RCodeFromError(last) == 0 && !go_errors.Is(last, dns.ErrEmptyResponse) {
 			return errors.New("returning nil for domain ", domain).Base(errors.Combine(errs...))
 		}
+		noRNF = last
 	}
 	if go_errors.Is(noRNF, dns.ErrEmptyResponse) {
 		return dns.ErrEmptyResponse

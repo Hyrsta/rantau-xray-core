@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -21,6 +22,9 @@ import (
 // Handler is an outbound connection that silently swallow the entire payload.
 type Handler struct {
 	response []byte
+	// closed ends the UDP flows' waits when the instance closes
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 var http403response = http.Response{
@@ -51,6 +55,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	}
 	return &Handler{
 		response: response,
+		closed:   make(chan struct{}),
 	}, nil
 }
 
@@ -75,9 +80,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		timer := signal.CancelAfterInactivity(ctx, func() {
 			cancel()
 		}, time.Duration(30+dice.Roll(61))*time.Second)
+		// The timer's check holds the flow's context, and the instance with it, until it fires: end it with the wait
+		defer timer.SetTimeout(0)
 		go buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-h.closed:
+		}
 	}
+	return nil
+}
+
+// Close implements common.Closable. It ends the blocked UDP flows' waits at once: an embedder that restarts the
+// instance in its process (Android reconnects) would otherwise keep each closed instance for up to 90 s
+func (h *Handler) Close() error {
+	h.closeOnce.Do(func() { close(h.closed) })
 	return nil
 }
 
