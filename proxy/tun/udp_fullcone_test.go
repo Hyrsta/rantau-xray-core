@@ -1,75 +1,91 @@
 package tun
 
 import (
-	"bytes"
-	"io"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 )
 
-func TestUDPDirectTrafficStillReturnsData(t *testing.T) {
-	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40000)
-	dst := net.UDPDestination(net.ParseAddress("192.168.1.1"), 443)
-	replied := make(chan []byte, 1)
-	refused := false
-	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
-		defer c.Close()
-		b := make([]byte, 64)
-		n, err := c.Read(b)
-		if err == nil {
-			c.Write(b[:n])
-		}
-	}, func(b []byte, from, to net.Destination) error {
-		if from != dst || to != src {
-			t.Error("return direction changed")
-		}
-		replied <- append([]byte(nil), b...)
-		return nil
-	})
-	h.HandlePacket(src, dst, []byte("direct QUIC"), func() error { refused = true; return nil })
-	select {
-	case b := <-replied:
-		if !bytes.Equal(b, []byte("direct QUIC")) {
-			t.Fatal("payload changed")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no UDP reply")
-	}
-	if refused {
-		t.Fatal("direct traffic refused")
+// BenchmarkUDPNewSession measures what one new UDP flow costs the
+// inbound while it stays open: QUIC and DNS open many short flows, and each
+// one lives until the connection idle timeout.
+func BenchmarkUDPNewSession(b *testing.B) {
+	u := newUdpConnectionHandler(func(conn net.Conn, dest net.Destination) {}, nil)
+	dst := net.UDPDestination(net.ParseAddress("1.1.1.1"), 443)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		src := net.UDPDestination(net.IPAddress([]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), net.Port(1024+i%60000))
+		u.HandlePacket(src, dst, &buf.Buffer{})
 	}
 }
 
-func TestUDPEarlyRefusalDoesNotRacePacketSendOrReplacement(t *testing.T) {
-	src := net.UDPDestination(net.ParseAddress("172.19.0.2"), 40001)
-	dst := net.UDPDestination(net.ParseAddress("198.51.100.1"), 443)
-	var done sync.WaitGroup
-	h := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) {
-		c.(*udpConn).RejectUDP()
-		c.Close()
-		_, err := c.Read(make([]byte, 32))
-		if err != nil && err != io.EOF {
-			t.Error(err)
+func TestPacketQueueOrderAndClose(t *testing.T) {
+	q := newPacketQueue(udpQueueLimit)
+	for i := 0; i < 3; i++ {
+		b := buf.New()
+		b.WriteByte(byte(i))
+		if !q.push(b) {
+			t.Fatalf("push %d rejected", i)
 		}
-		done.Done()
-	}, nil)
-	// Each creation adds once under the same handler lock as creation; reject callback
-	// can immediately close while the producer is enqueueing the first datagram.
+	}
+	for i := 0; i < 3; i++ {
+		b, ok := q.pop()
+		if !ok || b.Byte(0) != byte(i) {
+			t.Fatalf("pop %d: got %v, %v", i, b, ok)
+		}
+		b.Release()
+	}
+	q.close()
+	if _, ok := q.pop(); ok {
+		t.Fatal("pop after close returned a packet")
+	}
+	if q.push(&buf.Buffer{}) {
+		t.Fatal("push after close accepted")
+	}
+}
+
+func TestPacketQueueLimit(t *testing.T) {
+	q := newPacketQueue(udpQueueLimit)
+	for i := 0; i < udpQueueLimit; i++ {
+		if !q.push(&buf.Buffer{}) {
+			t.Fatalf("push %d rejected below the limit", i)
+		}
+	}
+	if q.push(&buf.Buffer{}) {
+		t.Fatal("push above the limit accepted")
+	}
+}
+
+func TestPacketQueueCloseUnblocksReader(t *testing.T) {
+	q := newPacketQueue(udpQueueLimit)
+	done := make(chan bool)
+	go func() {
+		_, ok := q.pop()
+		done <- ok
+	}()
+	q.close()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("blocked pop returned a packet after close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not wake the reader")
+	}
+}
+
+func TestPacketQueueDropsDrainedStorage(t *testing.T) {
+	q := newPacketQueue(udpQueueLimit)
 	for i := 0; i < 100; i++ {
-		done.Add(1)
-		h.HandlePacket(src, dst, []byte("x"), func() error { return nil })
-		done.Wait()
+		q.push(&buf.Buffer{})
 	}
-	old := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
-	current := &udpConn{handler: h, src: src, dst: dst, egress: make(chan []byte, 1)}
-	flow := udpFlow{src: src, dst: dst}
-	h.udpConns[flow] = current
-	old.Close()
-	if h.udpConns[flow] != current {
-		t.Fatal("stale close deleted replacement")
+	for i := 0; i < 100; i++ {
+		q.pop()
 	}
-	current.Close()
+	if q.items != nil {
+		t.Fatalf("drained queue still holds %d slots", cap(q.items))
+	}
 }

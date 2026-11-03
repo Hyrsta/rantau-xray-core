@@ -2,90 +2,28 @@ package tun
 
 import (
 	"context"
+	"net/netip"
 	"testing"
+	"time"
 
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"github.com/xtls/xray-core/common/net"
 )
 
-type startupDispatcher struct{ stack.NetworkDispatcher }
-type startupEndpoint struct {
-	stack.LinkEndpoint
-	calls    []stack.NetworkDispatcher
-	closes   int
-	onAttach func()
+// countingStack is a Stack that counts what Handler does with it
+type countingStack struct {
+	Stack
+	starts, closes int
 }
 
-func (e *startupEndpoint) Attach(d stack.NetworkDispatcher) {
-	e.calls = append(e.calls, d)
-	if d != nil && e.onAttach != nil {
-		e.onAttach()
-	}
-}
-func (e *startupEndpoint) Close()                           { e.closes++ }
-func (e *startupEndpoint) GSOMaxSize() uint32               { return 12345 }
-func (e *startupEndpoint) SupportedGSO() stack.SupportedGSO { return stack.HostGSOSupported }
+func (s *countingStack) Start() error { s.starts++; return nil }
+func (s *countingStack) Close() error { s.closes++; return nil }
 
-func TestEndpointActivationPublishesInitialization(t *testing.T) {
-	initialized := 0
-	seen := make(chan int, 1)
-	underlying := &startupEndpoint{onAttach: func() { go func() { seen <- initialized }() }}
-	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
-	dispatcher := &startupDispatcher{}
-	endpoint.Attach(dispatcher)
-	if len(underlying.calls) != 0 || !endpoint.IsAttached() {
-		t.Fatal("attachment started reads before activation")
-	}
-	initialized = 42
-	if err := endpoint.activate(); err != nil {
-		t.Fatal(err)
-	}
-	if got := <-seen; got != 42 {
-		t.Fatalf("receiver saw partially initialized state %d", got)
-	}
-	if err := endpoint.activate(); err != nil {
-		t.Fatal(err)
-	}
-	if len(underlying.calls) != 1 || underlying.calls[0] != dispatcher {
-		t.Fatal("activation must attach exactly once")
-	}
-	if endpoint.GSOMaxSize() != 12345 || endpoint.SupportedGSO() != stack.HostGSOSupported {
-		t.Fatal("optional GSO capabilities lost")
-	}
-	endpoint.Attach(nil)
-	if endpoint.IsAttached() || len(underlying.calls) != 2 || underlying.calls[1] != nil {
-		t.Fatal("detach not forwarded")
-	}
-	endpoint.Close()
+type countingTun struct {
+	Tun
+	closes int
 }
 
-func TestEndpointClosedBeforeActivationNeverStartsReads(t *testing.T) {
-	underlying := &startupEndpoint{}
-	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
-	endpoint.Attach(&startupDispatcher{})
-	endpoint.Close()
-	endpoint.Close()
-	if err := endpoint.activate(); err == nil {
-		t.Fatal("closed endpoint reactivated")
-	}
-	endpoint.Attach(&startupDispatcher{})
-	if len(underlying.calls) != 0 || underlying.closes != 1 || endpoint.IsAttached() {
-		t.Fatal("closed pending endpoint leaked a reader or closed twice")
-	}
-}
-
-func TestEndpointDetachedBeforeActivationDoesNotStartReader(t *testing.T) {
-	underlying := &startupEndpoint{}
-	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
-	endpoint.Attach(&startupDispatcher{})
-	endpoint.Attach(nil)
-	if err := endpoint.activate(); err != nil {
-		t.Fatal(err)
-	}
-	if len(underlying.calls) != 0 {
-		t.Fatal("detached dispatcher started reader")
-	}
-	endpoint.Close()
-}
+func (t *countingTun) Close() error { t.closes++; return nil }
 
 func TestStartupPolicyIsOptInAndInstanceLocal(t *testing.T) {
 	ordinary := context.Background()
@@ -93,40 +31,72 @@ func TestStartupPolicyIsOptInAndInstanceLocal(t *testing.T) {
 	if ordinary.Value(ipv6RefusalKey{}) != nil || ordinary.Value(deferredStartupKey{}) != nil {
 		t.Fatal("ordinary instances inherited Rantau policy")
 	}
-	if guarded.Value(ipv6RefusalKey{}) != true || guarded.Value(deferredStartupKey{}) == nil {
+	// what Init reads
+	if guarded.Value(ipv6RefusalKey{}) != true || guarded.Value(deferredStartupKey{}) != true {
 		t.Fatal("instance policy missing")
 	}
-	endpoint := &deferredLinkEndpoint{LinkEndpoint: &LinkEndpoint{}}
-	if endpoint.GSOMaxSize() != 0 || endpoint.SupportedGSO() != stack.GSONotSupported {
-		t.Fatal("non-GSO endpoint gained GSO capability")
-	}
 }
 
-func TestClosedStackCannotActivateDeferredEndpoint(t *testing.T) {
-	underlying := &startupEndpoint{}
-	endpoint := &deferredLinkEndpoint{LinkEndpoint: underlying}
-	endpoint.Attach(&startupDispatcher{})
-	tunStack := &stackGVisor{stack: stack.New(stack.Options{}), endpoint: endpoint}
-	if err := tunStack.Close(); err != nil {
+// Packets that the system queued before the core started wait until Activate, which reads them once
+func TestDeferredStackReadsOnlyAfterActivation(t *testing.T) {
+	p, l := newPeer(t, "172.19.0.2:40100", "198.51.100.10:443")
+	s, err := NewStack(context.Background(), StackOptions{Tun: l, MTU: testMTU}, connectionFunc(func(net.Conn, net.Destination) {}))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tunStack.Activate(); err == nil {
-		t.Fatal("closed stack activated its deferred reader")
+	h := &Handler{deferred: true, stack: s, tun: l}
+	defer h.Close()
+	l.in <- ping(p.src.Addr(), p.dst.Addr())
+	p.silent(100 * time.Millisecond)
+	if err := h.Activate(); err != nil {
+		t.Fatal(err)
 	}
-	if len(underlying.calls) != 0 || underlying.closes != 1 {
-		t.Fatal("closed stack leaked a reader or device")
+	if packet, ok := parsePacket(p.packet(), 0); !ok || packet.proto != protoICMPv4 || packet.src != p.dst.Addr() || packet.payload[0] != 0 {
+		t.Fatal("queued ping not answered after activation")
+	}
+	if err := h.Activate(); err != nil {
+		t.Fatal("repeated activation: ", err)
+	}
+	l.in <- ping(p.src.Addr(), netip.MustParseAddr("198.51.100.11"))
+	p.packet()
+	p.silent(100 * time.Millisecond)
+}
+
+func TestActivationStartsOnceAndCloseIsIdempotent(t *testing.T) {
+	stack, device := &countingStack{}, &countingTun{}
+	h := &Handler{deferred: true, stack: stack, tun: device}
+	for i := 0; i < 3; i++ {
+		if err := h.Activate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal("second close: ", err)
+	}
+	if err := h.Activate(); err == nil {
+		t.Fatal("closed TUN activated")
+	}
+	if stack.starts != 1 || stack.closes != 1 || device.closes != 1 {
+		t.Fatalf("starts=%d closes=%d device closes=%d", stack.starts, stack.closes, device.closes)
 	}
 }
 
-func TestDeferredStartupCleanupIsIdempotent(t *testing.T) {
-	ctx := WithDeferredStartup(context.Background())
-	state := ctx.Value(deferredStartupKey{}).(*deferredStartupState)
-	calls := 0
-	state.add(func() { calls++ })
-	if !CleanupDeferredStartup(ctx) || !CleanupDeferredStartup(ctx) || calls != 1 {
-		t.Fatal("resource cleanup or ownership was repeated/lost")
+func TestClosedBeforeActivationNeverStartsReads(t *testing.T) {
+	stack := &countingStack{}
+	h := &Handler{deferred: true, stack: stack, tun: &countingTun{}}
+	h.Close()
+	if err := h.Activate(); err == nil || stack.starts != 0 {
+		t.Fatal("closed pending TUN started reading")
 	}
-	if CleanupDeferredStartup(context.Background()) {
-		t.Fatal("ordinary instance claimed device ownership")
+	if err := (&Handler{deferred: true}).Activate(); err == nil {
+		t.Fatal("activated a TUN that never started")
+	}
+	// started at once without WithDeferredStartup, so Activate has nothing to do
+	immediate := &countingStack{}
+	if err := (&Handler{stack: immediate}).Activate(); err != nil || immediate.starts != 0 {
+		t.Fatal("activation of an ordinary instance started its stack again")
 	}
 }

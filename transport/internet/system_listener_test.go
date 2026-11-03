@@ -13,8 +13,8 @@ import (
 func TestRegisterListenerController(t *testing.T) {
 	var gotFd uintptr
 
-	common.Must(internet.RegisterListenerController(func(network, address string, conn syscall.RawConn) error {
-		return conn.Control(func(fd uintptr) {
+	common.Must(internet.RegisterListenerController(func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
 			gotFd = fd
 		})
 	}))
