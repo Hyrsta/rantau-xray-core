@@ -2,9 +2,11 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.1` supplies the
-exact source built into the Rantau VPN apps from their first releases with Xray v26.10.31. Earlier Android,
-macOS and Windows releases retain their respective source tags (`v26.3.27-rantau`, `.2` and `.3`). This
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.2` supplies the
+exact source built into Android 0.1.59 and macOS 0.2.48, the first releases with Xray v26.10.31. Their
+licence notices name `v26.10.31-rantau.1`, which lacks the pre-connect trial build switch below
+(`preconnect_policy.go`, `preconnect_policy_trial.go` and their changes to `preconnect.go`). Earlier
+Android, macOS and Windows releases retain their respective source tags (`v26.3.27-rantau`, `.2` and `.3`). This
 source is published under Xray-core's own licence, the Mozilla Public License 2.0 ([LICENSE](LICENSE)).
 
 ## What differs from the original
@@ -31,6 +33,10 @@ included as they are.
   connections; handler shutdown cancels and drains owned work. Speculative REALITY authentication
   failures close the raw socket without detached camouflage requests, and unused TLS reserves close
   through the raw socket.
+- **Pre-connect trial build switch.** The reserve's lifetime comes from `preconnect_policy.go` (two
+  seconds, as above). A trial build with `-tags preconnect_trial` uses `preconnect_policy_trial.go`
+  instead: spares wait 20 to 40 seconds and are checked through TLS just before use, falling back to a
+  normal dial when the server has already closed them.
 - **Instance shutdown.** Closing an instance ends the TUN stack's UDP flows (a packet still on its
   way opens none) and closes the DNS app's nameservers (UDP link and request timer, DoH idle
   connections), so a stopped instance is released at once instead of after their idle timeouts.

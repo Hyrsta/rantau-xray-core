@@ -1474,11 +1474,14 @@
  }
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect.go
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,293 @@
 +package outbound
 +
 +import (
 +	"context"
++	"errors"
++	"fmt"
++	"math/rand/v2"
 +	"net"
 +	"sync"
 +	"sync/atomic"
@@ -1491,22 +1494,42 @@
 +)
 +
 +// A demand-driven reserve, never a connection multiplexer. At most two extra
-+// connections can be dialing/idle. Idle expiry never replenishes the reserve.
-+// Two seconds is deliberately below even the historical four-second server
-+// VLESS-header timeout. No application payload is sent until a caller takes it.
++// connections can be dialing/idle, and each carries exactly one request with
++// Vision as usual. No application payload is sent until a caller takes it.
++// How long a spare may wait, whether it is checked before use and whether an
++// expiring spare is replaced come from preconnectBuildPolicy: today's two-second
++// reserve in normal builds, the trial policy with -tags preconnect_trial.
 +const (
 +	preconnectMax         = 2
-+	preconnectTTL         = 2 * time.Second
 +	preconnectDialTimeout = 3 * time.Second
 +	preconnectBackoff     = 250 * time.Millisecond
 +)
 +
-+var preconnectHits, preconnectMisses, preconnectDials atomic.Int64
++// Servers close a connection that sends no VLESS request within their handshake
++// timeout: 60 s on Xray v26.10.31 (measured on production 2026-11-03: 59.4 s
++// Singapore, 59.9 s Tokyo), 4 s on older servers. A spare must be used or dropped
++// well before that; the check catches a server that hung up earlier anyway.
++type preconnectPolicy struct {
++	ttlMin, ttlMax time.Duration // each spare's lifetime, chosen at random in [ttlMin, ttlMax]
++	check          time.Duration // >0: before use, read through TLS this long to find a closed spare
++	warm           time.Duration // >0: replace an expiring spare while the last real request is this recent
++}
++
++var preconnectHits, preconnectMisses, preconnectDials, preconnectStale atomic.Int64
 +
 +// Aggregate process-lifetime counters, without browsing destinations or payloads.
 +func PreconnectHits() int64   { return preconnectHits.Load() }
 +func PreconnectMisses() int64 { return preconnectMisses.Load() }
 +func PreconnectDials() int64  { return preconnectDials.Load() }
++
++// PreconnectStale counts spares found closed by the server when a request wanted them.
++func PreconnectStale() int64 { return preconnectStale.Load() }
++
++// PreconnectPolicy names this build's reserve policy for logs, e.g. "trial 20s-40s check 2ms warm 0s".
++func PreconnectPolicy() string {
++	p := preconnectBuildPolicy
++	return fmt.Sprintf("%s %v-%v check %v warm %v", preconnectPolicyName, p.ttlMin, p.ttlMax, p.check, p.warm)
++}
 +
 +type preconnectSpare struct {
 +	conn    stat.Connection
@@ -1515,18 +1538,20 @@
 +}
 +
 +type preconnectPool struct {
-+	mu               sync.Mutex
-+	ctx              context.Context
-+	cancel           context.CancelFunc
-+	dial             func(context.Context) (stat.Connection, error)
-+	limit            int
-+	ttl, dialTimeout time.Duration
-+	ready            []*preconnectSpare
-+	inFlight         int
-+	failures         uint
-+	nextTry          time.Time
-+	closed           bool
-+	wg               sync.WaitGroup
++	mu          sync.Mutex
++	ctx         context.Context
++	cancel      context.CancelFunc
++	dial        func(context.Context) (stat.Connection, error)
++	limit       int
++	policy      preconnectPolicy
++	dialTimeout time.Duration
++	ready       []*preconnectSpare
++	inFlight    int
++	failures    uint
++	nextTry     time.Time
++	lastDemand  time.Time
++	closed      bool
++	wg          sync.WaitGroup
 +}
 +
 +func newPreconnectPool(limit int, dial func(context.Context) (stat.Connection, error)) *preconnectPool {
@@ -1534,43 +1559,96 @@
 +		limit = preconnectMax
 +	}
 +	ctx, cancel := context.WithCancel(context.Background())
-+	return &preconnectPool{ctx: ctx, cancel: cancel, dial: dial, limit: limit, ttl: preconnectTTL, dialTimeout: preconnectDialTimeout}
++	return &preconnectPool{ctx: ctx, cancel: cancel, dial: dial, limit: limit, policy: preconnectBuildPolicy, dialTimeout: preconnectDialTimeout}
++}
++
++// lifetime spreads spares over [ttlMin, ttlMax] so their closes do not tick at a fixed interval.
++func (p *preconnectPool) lifetime() time.Duration {
++	if spread := p.policy.ttlMax - p.policy.ttlMin; spread > 0 {
++		return p.policy.ttlMin + rand.N(spread+1)
++	}
++	return p.policy.ttlMin
 +}
 +
 +// Take returns immediately when the reserve is empty; callers use their normal
 +// request-context dial. Only demand calls can create work, with a bounded retry
-+// cooldown after errors. Timer callbacks only discard stale idle connections.
++// cooldown after errors. A spare the server already closed is discarded and the
++// next one tried, so a stale spare never fails the request: at worst it dials.
 +func (p *preconnectPool) Take() stat.Connection {
++	refilled := false
++	for {
++		spare, ok := p.pop(!refilled)
++		refilled = true
++		if !ok {
++			return nil
++		}
++		if spare == nil {
++			preconnectMisses.Add(1)
++			return nil
++		}
++		if p.policy.check > 0 && !preconnectAlive(spare.conn, p.policy.check) {
++			preconnectStale.Add(1)
++			discardPreconnect(spare.conn)
++			continue
++		}
++		preconnectHits.Add(1)
++		return spare.conn
++	}
++}
++
++// pop removes the first unexpired spare (nil when there is none) and, once per
++// request, starts refills up to the limit. ok is false after Close.
++func (p *preconnectPool) pop(demand bool) (spare *preconnectSpare, ok bool) {
 +	p.mu.Lock()
 +	defer p.mu.Unlock()
 +	if p.closed {
-+		return nil
++		return nil, false
 +	}
 +	now := time.Now()
-+	var conn stat.Connection
 +	for len(p.ready) > 0 {
-+		spare := p.ready[0]
++		s := p.ready[0]
 +		p.ready = p.ready[1:]
-+		spare.timer.Stop()
-+		if now.Before(spare.expires) {
-+			conn = spare.conn
++		s.timer.Stop()
++		if now.Before(s.expires) {
++			spare = s
 +			break
 +		}
-+		discardPreconnect(spare.conn)
++		discardPreconnect(s.conn)
 +	}
-+	if !now.Before(p.nextTry) {
-+		for len(p.ready)+p.inFlight < p.limit {
-+			p.inFlight++
-+			p.wg.Add(1)
-+			go p.fill()
-+		}
++	if demand {
++		p.lastDemand = now
++		p.refillLocked(now)
 +	}
-+	if conn != nil {
-+		preconnectHits.Add(1)
-+	} else {
-+		preconnectMisses.Add(1)
++	return spare, true
++}
++
++func (p *preconnectPool) refillLocked(now time.Time) {
++	if now.Before(p.nextTry) {
++		return
 +	}
-+	return conn
++	for len(p.ready)+p.inFlight < p.limit {
++		p.inFlight++
++		p.wg.Add(1)
++		go p.fill()
++	}
++}
++
++// preconnectAlive reports whether an unused spare is still open. It reads through
++// the TLS layer, which consumes the server's post-handshake records (REALITY sends
++// them as the real site would); a raw-socket peek would either eat those bytes or
++// hide a close behind them. A read that times out leaves a TLS connection usable.
++// A VLESS server never speaks first, so any data, EOF or other error means closed.
++func preconnectAlive(conn stat.Connection, wait time.Duration) bool {
++	if conn.SetReadDeadline(time.Now().Add(wait)) != nil {
++		return false
++	}
++	var one [1]byte
++	n, err := conn.Read(one[:])
++	var timeout net.Error
++	if n > 0 || !errors.As(err, &timeout) || !timeout.Timeout() {
++		return false
++	}
++	return conn.SetReadDeadline(time.Time{}) == nil
 +}
 +
 +func (p *preconnectPool) fill() {
@@ -1596,11 +1674,15 @@
 +	}
 +	p.failures = 0
 +	p.nextTry = time.Time{}
-+	spare := &preconnectSpare{conn: conn, expires: time.Now().Add(p.ttl)}
++	life := p.lifetime()
++	spare := &preconnectSpare{conn: conn, expires: time.Now().Add(life)}
 +	p.ready = append(p.ready, spare)
-+	spare.timer = time.AfterFunc(p.ttl, func() { p.expire(spare) })
++	spare.timer = time.AfterFunc(life, func() { p.expire(spare) })
 +}
 +
++// expire drops an unused spare at the end of its lifetime. It is replaced only
++// inside the policy's warm window after a real request (never in normal builds),
++// so an idle device stops making connections once that window has passed.
 +func (p *preconnectPool) expire(spare *preconnectSpare) {
 +	p.mu.Lock()
 +	defer p.mu.Unlock()
@@ -1608,6 +1690,9 @@
 +		if s == spare {
 +			p.ready = append(p.ready[:i], p.ready[i+1:]...)
 +			discardPreconnect(s.conn)
++			if now := time.Now(); !p.closed && p.policy.warm > 0 && now.Sub(p.lastDemand) < p.policy.warm {
++				p.refillLocked(now)
++			}
 +			return
 +		}
 +	}
@@ -1684,14 +1769,61 @@
 +	return pool.Take()
 +}
 --- /dev/null
++++ b/proxy/vless/outbound/preconnect_policy.go
+@@ -0,0 +1,13 @@
++//go:build !preconnect_trial
++
++package outbound
++
++import "time"
++
++// Today's reserve (Android 0.1.27 and later): a spare lives two seconds, below even
++// the historical four-second server handshake timeout, so it only helps a burst of
++// requests and is never checked or replaced. A trial build swaps in
++// preconnect_policy_trial.go with -tags preconnect_trial.
++const preconnectPolicyName = "standard"
++
++var preconnectBuildPolicy = preconnectPolicy{ttlMin: 2 * time.Second, ttlMax: 2 * time.Second}
+--- /dev/null
++++ b/proxy/vless/outbound/preconnect_policy_trial.go
+@@ -0,0 +1,20 @@
++//go:build preconnect_trial
++
++package outbound
++
++import "time"
++
++// Trial reserve (docs/PRECONNECT.md), built only with -tags preconnect_trial. A spare
++// waits up to 20-40 s, well inside the servers' 60 s, so the first request after a
++// short pause skips the TCP and REALITY handshakes. It is checked through TLS just
++// before use, so a spare the server already closed falls back to a normal dial
++// instead of failing. warm 0: an expiring spare is not replaced, so a device that
++// stops making requests stops making connections (owner to confirm these values).
++const preconnectPolicyName = "trial"
++
++var preconnectBuildPolicy = preconnectPolicy{
++	ttlMin: 20 * time.Second,
++	ttlMax: 40 * time.Second,
++	check:  2 * time.Millisecond,
++	warm:   0,
++}
+--- /dev/null
 +++ b/proxy/vless/outbound/preconnect_test.go
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,415 @@
 +package outbound
 +
 +import (
 +	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
 +	"errors"
++	"io"
++	"math/big"
 +	"net"
++	"os"
 +	"strings"
 +	"sync/atomic"
 +	"testing"
@@ -1711,6 +1843,21 @@
 +}
 +
 +func (c *trackedConn) Close() error { c.closed.Add(1); return nil }
++
++// Without a connection of its own a trackedConn is open and silent: the liveness
++// check's short read times out, as on a live spare.
++func (c *trackedConn) SetReadDeadline(t time.Time) error {
++	if c.Conn != nil {
++		return c.Conn.SetReadDeadline(t)
++	}
++	return nil
++}
++func (c *trackedConn) Read(b []byte) (int, error) {
++	if c.Conn != nil {
++		return c.Conn.Read(b)
++	}
++	return 0, os.ErrDeadlineExceeded
++}
 +func eventually(t *testing.T, f func() bool) {
 +	t.Helper()
 +	end := time.Now().Add(time.Second)
@@ -1743,7 +1890,7 @@
 +	var calls atomic.Int32
 +	conn := &trackedConn{}
 +	p := newPreconnectPool(1, func(context.Context) (stat.Connection, error) { calls.Add(1); return conn, nil })
-+	p.ttl = 30 * time.Millisecond
++	p.policy = preconnectPolicy{ttlMin: 30 * time.Millisecond, ttlMax: 30 * time.Millisecond}
 +	defer p.Close()
 +	p.Take()
 +	eventually(t, func() bool { return readyCount(p) == 1 })
@@ -1927,6 +2074,155 @@
 +	eventually(t, func() bool { return readyCount(p) == 2 })
 +	if PreconnectHits() != hits+1 || d.fresh.Load() != 3 || d.reserve.Load() != 3 || first.conn.(*trackedConn).closed.Load() != 1 || second.conn.(*trackedConn).closed.Load() != 0 {
 +		t.Fatal("app reserve ownership/refill changed after health call")
++	}
++}
++
++// A spare whose reads are scripted: what the liveness check would find on its socket.
++type scriptedConn struct {
++	trackedConn
++	read func([]byte) (int, error)
++}
++
++func (c *scriptedConn) Read(b []byte) (int, error) { return c.read(b) }
++
++func readySpare(c stat.Connection) *preconnectSpare {
++	return &preconnectSpare{conn: c, expires: time.Now().Add(time.Hour), timer: time.AfterFunc(time.Hour, func() {})}
++}
++
++func TestPreconnectLifetimeSpreadsInsidePolicy(t *testing.T) {
++	p := newPreconnectPool(1, nil)
++	defer p.Close()
++	p.policy = preconnectPolicy{ttlMin: 20 * time.Second, ttlMax: 40 * time.Second}
++	lo, hi := time.Hour, time.Duration(0)
++	for i := 0; i < 2000; i++ {
++		d := p.lifetime()
++		if d < 20*time.Second || d > 40*time.Second {
++			t.Fatalf("lifetime %v outside 20-40 s", d)
++		}
++		lo, hi = min(lo, d), max(hi, d)
++	}
++	if lo > 22*time.Second || hi < 38*time.Second {
++		t.Fatalf("lifetimes not spread over the range: %v-%v", lo, hi)
++	}
++}
++
++func TestPreconnectStaleSparesFallBackInsteadOfFailing(t *testing.T) {
++	p := newPreconnectPool(2, func(ctx context.Context) (stat.Connection, error) { <-ctx.Done(); return nil, ctx.Err() })
++	defer p.Close()
++	p.policy = preconnectPolicy{ttlMin: time.Hour, ttlMax: time.Hour, check: 5 * time.Millisecond}
++	hungUp := &scriptedConn{read: func([]byte) (int, error) { return 0, io.EOF }}
++	live := &trackedConn{}
++	stale, hits, misses := PreconnectStale(), PreconnectHits(), PreconnectMisses()
++	p.ready = []*preconnectSpare{readySpare(hungUp), readySpare(live)}
++	if got := p.Take(); got != live {
++		t.Fatal("the live spare was not used after the closed one")
++	}
++	if hungUp.closed.Load() != 1 || live.closed.Load() != 0 || PreconnectStale() != stale+1 || PreconnectHits() != hits+1 {
++		t.Fatal("the closed spare was not discarded and counted as stale")
++	}
++
++	// Every spare closed (one hung up, one already sending data): the request
++	// gets no spare at once and dials normally.
++	spoke := &scriptedConn{read: func(b []byte) (int, error) { b[0] = 0x17; return 1, nil }}
++	reset := &scriptedConn{read: func([]byte) (int, error) { return 0, errors.New("connection reset by peer") }}
++	p.mu.Lock()
++	p.ready = []*preconnectSpare{readySpare(spoke), readySpare(reset)}
++	p.mu.Unlock()
++	started := time.Now()
++	if p.Take() != nil {
++		t.Fatal("a closed spare was leased")
++	}
++	if time.Since(started) > 100*time.Millisecond {
++		t.Fatal("checking closed spares delayed the request's own dial")
++	}
++	if spoke.closed.Load() != 1 || reset.closed.Load() != 1 || PreconnectStale() != stale+3 || PreconnectMisses() != misses+1 {
++		t.Fatal("closed spares were not all discarded, or the miss was not counted once")
++	}
++}
++
++func selfSignedCert(t *testing.T) tls.Certificate {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{"localhost"}}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++}
++
++// The check must read through TLS: a TLS 1.3 server sends session tickets after
++// the handshake (REALITY copies the real site's), so bytes are waiting on an
++// idle spare's socket. Those must not count as "closed", the check must leave the
++// connection usable, and a server hang-up must be seen.
++func TestPreconnectCheckReadsThroughTLS(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	cert := selfSignedCert(t)
++	accepted := make(chan *tls.Conn, 1)
++	go func() {
++		raw, err := ln.Accept()
++		if err != nil {
++			return
++		}
++		s := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
++		if s.Handshake() == nil {
++			accepted <- s
++		}
++	}()
++	raw, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
++	defer c.Close()
++	if err := c.Handshake(); err != nil {
++		t.Fatal(err)
++	}
++	s := <-accepted
++	time.Sleep(50 * time.Millisecond) // the server's tickets are now waiting on the client's socket
++
++	if !preconnectAlive(c, 5*time.Millisecond) {
++		t.Fatal("an open TLS connection with pending session tickets was judged closed")
++	}
++	go func() {
++		got := make([]byte, 5)
++		if _, err := io.ReadFull(s, got); err == nil && string(got) == "hello" {
++			s.Write([]byte("reply"))
++		}
++	}()
++	if _, err := c.Write([]byte("hello")); err != nil {
++		t.Fatal("write after the check:", err)
++	}
++	c.SetReadDeadline(time.Now().Add(time.Second))
++	reply := make([]byte, 5)
++	if _, err := io.ReadFull(c, reply); err != nil || string(reply) != "reply" {
++		t.Fatalf("connection not usable after the check: %q %v", reply, err)
++	}
++	c.SetReadDeadline(time.Time{})
++
++	s.Close() // as at the server's handshake timeout
++	eventually(t, func() bool { return !preconnectAlive(c, 5*time.Millisecond) })
++}
++
++func TestPreconnectWarmWindowRefillsOnlyAfterRecentDemand(t *testing.T) {
++	var calls atomic.Int32
++	p := newPreconnectPool(1, func(context.Context) (stat.Connection, error) { calls.Add(1); return &trackedConn{}, nil })
++	defer p.Close()
++	p.policy = preconnectPolicy{ttlMin: 20 * time.Millisecond, ttlMax: 20 * time.Millisecond, warm: 150 * time.Millisecond}
++	p.Take()
++	eventually(t, func() bool { return calls.Load() >= 3 }) // replaced at expiry while the request is recent
++	time.Sleep(250 * time.Millisecond)                      // past the window: the last spare expires unreplaced
++	settled := calls.Load()
++	time.Sleep(100 * time.Millisecond)
++	if calls.Load() != settled || readyCount(p) != 0 {
++		t.Fatalf("idle pool kept dialing after the warm window: %d -> %d, ready %d", settled, calls.Load(), readyCount(p))
 +	}
 +}
 --- /dev/null
