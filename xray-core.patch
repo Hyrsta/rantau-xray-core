@@ -1689,7 +1689,7 @@
  }
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,292 @@
 +package outbound
 +
 +import (
@@ -1712,8 +1712,7 @@
 +// connections can be dialing/idle, and each carries exactly one request with
 +// Vision as usual. No application payload is sent until a caller takes it.
 +// How long a spare may wait, whether it is checked before use and whether an
-+// expiring spare is replaced come from preconnectBuildPolicy: today's two-second
-+// reserve in normal builds, the trial policy with -tags preconnect_trial.
++// expiring spare is replaced come from preconnectBuildPolicy (preconnect_policy.go).
 +const (
 +	preconnectMax         = 2
 +	preconnectDialTimeout = 3 * time.Second
@@ -1985,36 +1984,22 @@
 +}
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect_policy.go
-@@ -0,0 +1,13 @@
-+//go:build !preconnect_trial
-+
+@@ -0,0 +1,22 @@
 +package outbound
 +
 +import "time"
 +
-+// Today's reserve (Android 0.1.27 and later): a spare lives two seconds, below even
-+// the historical four-second server handshake timeout, so it only helps a burst of
-+// requests and is never checked or replaced. A trial build swaps in
-+// preconnect_policy_trial.go with -tags preconnect_trial.
++// The reserve's policy (docs/PRECONNECT.md), chosen by the owner after the 2026-11-03
++// trial and first released in Android 0.1.60, Mac 0.2.49 and Windows 1.0.54. A spare
++// waits 20-40 s at random, well inside the servers' 60 s wait for a first request, so
++// the first request after a short pause skips the TCP and REALITY handshakes. It is
++// checked through TLS just before use, so a spare the server already closed falls back
++// to a normal dial instead of failing. warm 0: an expiring spare is not replaced, so a
++// device that stops making requests stops making connections.
++//
++// To trial another policy, put it in a file behind a build tag and give this file the
++// opposite tag, as the 2026-11-03 trial did with -tags preconnect_trial.
 +const preconnectPolicyName = "standard"
-+
-+var preconnectBuildPolicy = preconnectPolicy{ttlMin: 2 * time.Second, ttlMax: 2 * time.Second}
---- /dev/null
-+++ b/proxy/vless/outbound/preconnect_policy_trial.go
-@@ -0,0 +1,20 @@
-+//go:build preconnect_trial
-+
-+package outbound
-+
-+import "time"
-+
-+// Trial reserve (docs/PRECONNECT.md), built only with -tags preconnect_trial. A spare
-+// waits up to 20-40 s, well inside the servers' 60 s, so the first request after a
-+// short pause skips the TCP and REALITY handshakes. It is checked through TLS just
-+// before use, so a spare the server already closed falls back to a normal dial
-+// instead of failing. warm 0: an expiring spare is not replaced, so a device that
-+// stops making requests stops making connections (owner to confirm these values).
-+const preconnectPolicyName = "trial"
 +
 +var preconnectBuildPolicy = preconnectPolicy{
 +	ttlMin: 20 * time.Second,

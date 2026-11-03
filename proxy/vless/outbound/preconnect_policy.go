@@ -1,13 +1,22 @@
-//go:build !preconnect_trial
-
 package outbound
 
 import "time"
 
-// Today's reserve (Android 0.1.27 and later): a spare lives two seconds, below even
-// the historical four-second server handshake timeout, so it only helps a burst of
-// requests and is never checked or replaced. A trial build swaps in
-// preconnect_policy_trial.go with -tags preconnect_trial.
+// The reserve's policy (docs/PRECONNECT.md), chosen by the owner after the 2026-11-03
+// trial and first released in Android 0.1.60, Mac 0.2.49 and Windows 1.0.54. A spare
+// waits 20-40 s at random, well inside the servers' 60 s wait for a first request, so
+// the first request after a short pause skips the TCP and REALITY handshakes. It is
+// checked through TLS just before use, so a spare the server already closed falls back
+// to a normal dial instead of failing. warm 0: an expiring spare is not replaced, so a
+// device that stops making requests stops making connections.
+//
+// To trial another policy, put it in a file behind a build tag and give this file the
+// opposite tag, as the 2026-11-03 trial did with -tags preconnect_trial.
 const preconnectPolicyName = "standard"
 
-var preconnectBuildPolicy = preconnectPolicy{ttlMin: 2 * time.Second, ttlMax: 2 * time.Second}
+var preconnectBuildPolicy = preconnectPolicy{
+	ttlMin: 20 * time.Second,
+	ttlMax: 40 * time.Second,
+	check:  2 * time.Millisecond,
+	warm:   0,
+}

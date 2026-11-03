@@ -20,8 +20,7 @@ import (
 // connections can be dialing/idle, and each carries exactly one request with
 // Vision as usual. No application payload is sent until a caller takes it.
 // How long a spare may wait, whether it is checked before use and whether an
-// expiring spare is replaced come from preconnectBuildPolicy: today's two-second
-// reserve in normal builds, the trial policy with -tags preconnect_trial.
+// expiring spare is replaced come from preconnectBuildPolicy (preconnect_policy.go).
 const (
 	preconnectMax         = 2
 	preconnectDialTimeout = 3 * time.Second
