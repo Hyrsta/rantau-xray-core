@@ -3,7 +3,7 @@ package outbound
 import "time"
 
 // The reserve's policy (docs/PRECONNECT.md), chosen by the owner after the 2026-11-03
-// trial and first released in Android 0.1.60, Mac 0.2.49 and Windows 1.0.54. A spare
+// trial (before it a spare lived two seconds and was never checked). A spare
 // waits 20-40 s at random, well inside the servers' 60 s wait for a first request, so
 // the first request after a short pause skips the TCP and REALITY handshakes. It is
 // checked through TLS just before use, so a spare the server already closed falls back

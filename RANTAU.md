@@ -2,16 +2,18 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.4` supplies the
-exact source built into Android 0.1.61, macOS 0.2.50 and Windows 1.0.54, and later releases until a newer
-tag (a comment in its `preconnect_policy.go` names Android 0.1.60 and Mac 0.2.49 as the first releases of
-the 20 to 40 second reserve; the versions here are the right ones). `v26.10.31-rantau.3` (the DNS answer
-fix with the earlier two-second reserve) was built into Android 0.1.60 and macOS 0.2.49, GitHub-only
-builds that were never offered to users. Android 0.1.59 and macOS 0.2.48, the first releases with Xray
-v26.10.31, use `v26.10.31-rantau.2` (their licence notices name `v26.10.31-rantau.1`, which lacks that
-release's pre-connect trial build switch). Earlier Android, macOS and Windows releases retain their
-respective source tags (`v26.3.27-rantau`, `.2` and `.3`). This source is published under Xray-core's own
-licence, the Mozilla Public License 2.0 ([LICENSE](LICENSE)).
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.5` supplies the
+exact source built into the Rantau VPN apps from their releases after Android 0.1.61, macOS 0.2.50 and
+Windows 1.0.54, until a newer tag. It differs from `v26.10.31-rantau.4` only in one comment in
+`proxy/vless/outbound/preconnect_policy.go`, which no longer names app versions. `v26.10.31-rantau.4`
+supplies Android 0.1.61, macOS 0.2.50 and Windows 1.0.54 (its comment names Android 0.1.60 and Mac 0.2.49
+as the first releases of the 20 to 40 second reserve; the versions here are the right ones).
+`v26.10.31-rantau.3` (the DNS answer fix with the earlier two-second reserve) was built into Android
+0.1.60 and macOS 0.2.49, GitHub-only builds that were never offered to users. Android 0.1.59 and macOS
+0.2.48, the first releases with Xray v26.10.31, use `v26.10.31-rantau.2` (their licence notices name
+`v26.10.31-rantau.1`, which lacks that release's pre-connect trial build switch). Earlier Android, macOS
+and Windows releases retain their respective source tags (`v26.3.27-rantau`, `.2` and `.3`). This source
+is published under Xray-core's own licence, the Mozilla Public License 2.0 ([LICENSE](LICENSE)).
 
 ## What differs from the original
 
