@@ -2,9 +2,11 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.5` supplies the
-exact source built into the Rantau VPN apps from their releases after Android 0.1.61, macOS 0.2.50 and
-Windows 1.0.54, until a newer tag. It differs from `v26.10.31-rantau.4` only in one comment in
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.6` supplies the
+exact source built into the Rantau VPN apps from their releases after Android 0.1.78, macOS 0.2.67 and
+Windows 1.0.73, until a newer tag. It differs from `.5` only in the dial outcomes described below.
+`v26.10.31-rantau.5` supplies the releases after Android 0.1.61, macOS 0.2.50 and Windows 1.0.54, up to
+and including Android 0.1.78, macOS 0.2.67 and Windows 1.0.73. It differs from `v26.10.31-rantau.4` only in one comment in
 `proxy/vless/outbound/preconnect_policy.go`, which no longer names app versions. `v26.10.31-rantau.4`
 supplies Android 0.1.61, macOS 0.2.50 and Windows 1.0.54 (its comment names Android 0.1.60 and Mac 0.2.49
 as the first releases of the 20 to 40 second reserve; the versions here are the right ones).
@@ -22,6 +24,9 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **Dial outcomes.** The VLESS outbound tells one process-wide observer (`outbound.SetDialObserver`)
+  the outcome of each dial to the server (TCP and REALITY), for the Rantau engine's early health check.
+  No destinations or payloads are passed.
 - **UDP/443 refusal.** The VLESS client rejects unsupported Vision UDP/443 after routing but before
   dialing, and the TUN inbound answers the application with an IPv4 ICMP port-unreachable that quotes
   only the original IP and UDP headers. Chinese/LAN direct UDP and explicitly enabled UDP443 remain

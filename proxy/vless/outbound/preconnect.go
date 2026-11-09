@@ -283,7 +283,7 @@ func (h *Handler) takePreconnect(ctx context.Context, dialer internet.Dialer) st
 			}
 			ctx = xctx.ContextWithID(ctx, session.NewID())
 			ctx = session.ContextWithPreconnect(ctx)
-			return dialer.Dial(ctx, h.server.Destination)
+			return h.dialServer(ctx, dialer)
 		})
 	}
 	pool := h.prePool
