@@ -1,3 +1,228 @@
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -98,11 +98,14 @@
+ 	policy policy.Manager
+ 	stats  stats.Manager
+ 	fdns   dns.FakeDNSEngine
++	// overrideSniffersOnly is what the context of the instance asks for, see WithOverrideSniffersOnly
++	overrideSniffersOnly bool
+ }
+ 
+ func init() {
+ 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+ 		d := new(DefaultDispatcher)
++		d.overrideSniffersOnly, _ = ctx.Value(overrideSniffersKey{}).(bool)
+ 		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, dc dns.Client) error {
+ 			core.OptionalFeatures(ctx, func(fdns dns.FakeDNSEngine) {
+ 				d.fdns = fdns
+@@ -292,7 +295,7 @@
+ 				reader: outbound.Reader.(*pipe.Reader),
+ 			}
+ 			outbound.Reader = cReader
+-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
++			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network, d.sniffersFor(sniffingRequest))
+ 			if err == nil {
+ 				content.Protocol = result.Protocol()
+ 			}
+@@ -347,7 +350,7 @@
+ 			reader: outbound.Reader.(buf.TimeoutReader),
+ 		}
+ 		outbound.Reader = cReader
+-		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
++		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network, d.sniffersFor(sniffingRequest))
+ 		if err == nil {
+ 			content.Protocol = result.Protocol()
+ 		}
+@@ -375,11 +378,23 @@
+ 	return nil
+ }
+ 
+-func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
++// sniffersFor is the protocols whose content sniffers run for a request: nil for all of them, as in Xray.
++func (d *DefaultDispatcher) sniffersFor(request session.SniffingRequest) []string {
++	if !d.overrideSniffersOnly {
++		return nil
++	}
++	// never nil: an inbound that names no protocol runs no content sniffer
++	return append([]string{}, request.OverrideDestinationForProtocol...)
++}
++
++func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, only []string) (SniffResult, error) {
+ 	payload := buf.NewWithSize(32767)
+ 	defer payload.Release()
+ 
+ 	sniffer := NewSniffer(ctx)
++	if only != nil {
++		sniffer.Only(only)
++	}
+ 
+ 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
+ 
+--- a/app/dispatcher/sniffer.go
++++ b/app/dispatcher/sniffer.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"slices"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -27,6 +28,8 @@
+ 	// It will not be shown as a traffic type for routing unless there is no other successful sniffing.
+ 	metadataSniffer bool
+ 	network         net.Network
++	// protocol is what a content sniffer finds, as inbounds name it in destOverride
++	protocol string
+ }
+ 
+ type Sniffer struct {
+@@ -36,11 +39,11 @@
+ func NewSniffer(ctx context.Context) *Sniffer {
+ 	ret := &Sniffer{
+ 		sniffer: []protocolSnifferWithMetadata{
+-			{func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, false, net.Network_TCP},
+-			{func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, false, net.Network_TCP},
+-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, false, net.Network_TCP},
+-			{func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) }, false, net.Network_UDP},
+-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, false, net.Network_UDP},
++			{func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, false, net.Network_TCP, "http"},
++			{func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, false, net.Network_TCP, "tls"},
++			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, false, net.Network_TCP, "bittorrent"},
++			{func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) }, false, net.Network_UDP, "quic"},
++			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, false, net.Network_UDP, "bittorrent"},
+ 		},
+ 	}
+ 	if sniffer, err := newFakeDNSSniffer(ctx); err == nil {
+@@ -52,6 +55,31 @@
+ 		}
+ 	}
+ 	return ret
++}
++
++// overrideSniffersKey marks an instance whose dispatcher runs only the content sniffers an inbound names in
++// destOverride, see WithOverrideSniffersOnly.
++type overrideSniffersKey struct{}
++
++// WithOverrideSniffersOnly asks this instance's dispatcher to run, for each connection, only the content
++// sniffers of the protocols its inbound names in destOverride. Xray runs all of them, so that routing rules
++// can name a protocol, and each one that cannot tell yet makes the connection wait for more data: BitTorrent's
++// need 20 bytes, so a first UDP datagram or TCP payload shorter than that (a game's ping, a small request)
++// waited for a second one, up to 200 ms. An instance that routes by name only loses nothing but that wait.
++// Metadata sniffers (FakeDNS) are kept. The setting is instance-local.
++func WithOverrideSniffersOnly(ctx context.Context) context.Context {
++	return context.WithValue(ctx, overrideSniffersKey{}, true)
++}
++
++// Only leaves the content sniffers of the named protocols, and every metadata sniffer.
++func (s *Sniffer) Only(protocols []string) {
++	kept := make([]protocolSnifferWithMetadata, 0, len(s.sniffer))
++	for _, si := range s.sniffer {
++		if si.metadataSniffer || slices.Contains(protocols, si.protocol) {
++			kept = append(kept, si)
++		}
++	}
++	s.sniffer = kept
+ }
+ 
+ var errUnknownContent = errors.New("unknown content")
+--- /dev/null
++++ b/app/dispatcher/sniffer_only_test.go
+@@ -0,0 +1,94 @@
++package dispatcher
++
++import (
++	"context"
++	"crypto/tls"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/core"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport/pipe"
++)
++
++// sniffed runs the dispatcher's sniffer on a connection whose first payload is given, and times it.
++func sniffed(t *testing.T, payload []byte, network xnet.Network, only []string) (SniffResult, error, time.Duration) {
++	t.Helper()
++	reader, writer := pipe.New(pipe.WithoutSizeLimit())
++	defer writer.Close()
++	if len(payload) > 0 {
++		b := buf.New()
++		b.Write(payload)
++		if err := writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// the sniffer looks for the instance's FakeDNS: an instance without one
++	instance, err := core.New(&core.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
++	start := time.Now()
++	result, err := sniffer(ctx, &cachedReader{reader: reader}, false, network, only)
++	return result, err, time.Since(start)
++}
++
++var asked = []string{"http", "tls", "quic"}
++
++// A first datagram or payload under 20 bytes waited for more data, because the BitTorrent sniffers could not
++// tell yet. An instance that asks only for the protocols it routes by decides at once.
++func TestOverrideSniffersOnlyDoesNotWaitOnShortPayloads(t *testing.T) {
++	short := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
++	for name, network := range map[string]xnet.Network{"udp": xnet.Network_UDP, "tcp": xnet.Network_TCP} {
++		t.Run(name, func(t *testing.T) {
++			if _, err, took := sniffed(t, short, network, nil); err == nil || took < 150*time.Millisecond {
++				t.Fatalf("all sniffers: %v after %v, expected Xray's wait for more data", err, took)
++			}
++			if _, err, took := sniffed(t, short, network, asked); err == nil || took > 50*time.Millisecond {
++				t.Fatalf("asked sniffers only: %v after %v, want no wait", err, took)
++			}
++		})
++	}
++}
++
++// The protocols that are asked for are still read.
++func TestOverrideSniffersOnlyStillReadsNames(t *testing.T) {
++	client, server := net.Pipe()
++	go func() {
++		_ = tls.Client(client, &tls.Config{ServerName: "www.example.com"}).Handshake()
++	}()
++	hello := make([]byte, 4096)
++	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
++	n, err := server.Read(hello)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = server.Close()
++	_ = client.Close()
++
++	result, err, _ := sniffed(t, hello[:n], xnet.Network_TCP, asked)
++	if err != nil || result.Protocol() != "tls" || result.Domain() != "www.example.com" {
++		t.Fatalf("TLS: %v, %v", result, err)
++	}
++	result, err, _ = sniffed(t, []byte("GET / HTTP/1.1\r\nHost: www.example.org\r\n\r\n"), xnet.Network_TCP, asked)
++	if err != nil || result.Protocol() != "http1" || result.Domain() != "www.example.org" {
++		t.Fatalf("HTTP: %v, %v", result, err)
++	}
++	// and one that is not asked for is not: no result, at once
++	if result, err, took := sniffed(t, []byte("GET / HTTP/1.1\r\nHost: www.example.org\r\n\r\n"), xnet.Network_TCP, []string{"tls"}); err == nil || took > 50*time.Millisecond {
++		t.Fatalf("HTTP without being asked: %v after %v", result, took)
++	}
++}
++
++func TestSnifferOnlyKeepsMetadataSniffers(t *testing.T) {
++	s := &Sniffer{sniffer: []protocolSnifferWithMetadata{
++		{protocol: "http"}, {protocol: "bittorrent"}, {metadataSniffer: true, protocol: "fakedns"}, {protocol: "quic"},
++	}}
++	s.Only([]string{"quic", "http"})
++	if len(s.sniffer) != 3 || s.sniffer[0].protocol != "http" || !s.sniffer[1].metadataSniffer || s.sniffer[2].protocol != "quic" {
++		t.Fatalf("kept %+v", s.sniffer)
++	}
++}
 --- a/app/dns/dns.go
 +++ b/app/dns/dns.go
 @@ -212,6 +212,11 @@
@@ -43,6 +268,121 @@
  	}
  	if go_errors.Is(noRNF, dns.ErrEmptyResponse) {
  		return dns.ErrEmptyResponse
+@@ -425,58 +443,70 @@
+ 	return nil, 0, mergeQueryErrors(domain, errs)
+ }
+ 
++// parallelQuery races the servers of one group (equal PolicyID, next to each other) and takes the groups in
++// order, as serialQuery takes single servers. Xray asks every server of every group at once; here a later
++// group is asked only when the one before it has failed, so a name is not sent to servers that are only a
++// fallback for it. Within a group the first server with addresses wins. The servers of a group stand for the
++// same resolver, so one DNS answer without usable addresses (no such name, an empty answer, an answer
++// expectedIPs set aside) decides for the group at once: a second connection to the same resolver answers a
++// lookup the first one is stuck on, and a stuck one never holds back a name the other has already answered.
+ func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+ 	var errs []error
+ 	clients := s.sortClients(domain)
+-
+-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
+-
+-	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
+-	results := make([]*queryResult, len(clients))
+-	pending := make([]int, len(groups))
+-	for gi, g := range groups {
+-		pending[gi] = g.end - g.start + 1
++	groups, _ := makeGroups( /*s.ctx,*/ clients)
++	for _, g := range groups {
++		ips, ttl, groupErrs := s.raceGroup(domain, option, clients[g.start:g.end+1])
++		if len(ips) > 0 {
++			return ips, ttl, nil
++		}
++		errs = append(errs, groupErrs...)
+ 	}
++	return nil, 0, mergeQueryErrors(domain, errs)
++}
+ 
+-	nextGroup := 0
+-	for range clients {
+-		result := <-resultsChan
+-		results[result.index] = &result
+-
+-		gi := groupOf[result.index]
+-		pending[gi]--
+-
+-		for nextGroup < len(groups) {
+-			g := groups[nextGroup]
+-
+-			// group race, minimum rtt -> return
+-			for j := g.start; j <= g.end; j++ {
+-				r := results[j]
+-				if r != nil && r.err == nil && len(r.ips) > 0 {
+-					return r.ips, r.ttl, nil
+-				}
+-			}
+-
+-			// current group is incomplete and no one success -> continue pending
+-			if pending[nextGroup] > 0 {
+-				break
+-			}
+-
+-			// all failed -> log and continue next group
+-			for j := g.start; j <= g.end; j++ {
+-				r := results[j]
+-				e := r.err
+-				if e == nil {
+-					e = dns.ErrEmptyResponse
+-				}
+-				errors.LogInfoInner(s.ctx, e, "failed to lookup ip for domain ", domain, " at server ", clients[j].Name(), " in parallel query mode")
+-				errs = append(errs, e)
+-			}
+-			nextGroup++
++// raceGroup asks every server of a group at once. It returns the first addresses, or the errors so far once
++// one server gave a DNS answer without addresses or all have failed. The decisive error comes last, where
++// mergeQueryErrors looks for the server that answered. Lookups still under way finish for the cache.
++func (s *DNS) raceGroup(domain string, option dns.IPOption, members []*Client) ([]net.IP, uint32, []error) {
++	var errs []error
++	failed := func(client *Client, err error) error {
++		if err == nil {
++			err = dns.ErrEmptyResponse
+ 		}
++		errors.LogInfoInner(s.ctx, err, "failed to lookup ip for domain ", domain, " at server ", client.Name(), " in parallel query mode")
++		errs = append(errs, err)
++		return err
+ 	}
++	if len(members) == 1 {
++		client := members[0]
++		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
++			errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
++			return nil, 0, nil
++		}
++		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
++		if len(ips) > 0 {
++			return ips, ttl, nil
++		}
++		failed(client, err)
++		return nil, 0, errs
++	}
++	results := asyncQueryAll(domain, option, members, s.ctx)
++	for range members {
++		result := <-results
++		if result.err == nil && len(result.ips) > 0 {
++			return result.ips, result.ttl, nil
++		}
++		if err := failed(members[result.index], result.err); answered(err) {
++			break
++		}
++	}
++	return nil, 0, errs
++}
+ 
+-	return nil, 0, mergeQueryErrors(domain, errs)
++// answered reports whether a failed lookup still carried a DNS answer: a response code, or a response
++// without usable addresses. A timeout or a failed connection did not.
++func answered(err error) bool {
++	return go_errors.Is(err, dns.ErrEmptyResponse) || dns.RCodeFromError(err) != 0
+ }
+ 
+ type queryResult struct {
 --- /dev/null
 +++ b/app/dns/merge_errors_test.go
 @@ -0,0 +1,51 @@
@@ -203,6 +543,156 @@
  // Name implements Server.
  func (s *ClassicNameServer) Name() string {
  	return s.cacheController.name
+--- /dev/null
++++ b/app/dns/race_test.go
+@@ -0,0 +1,147 @@
++package dns
++
++import (
++	"context"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	feature_dns "github.com/xtls/xray-core/features/dns"
++)
++
++// raceServer answers after a wait, or never (until the lookup's own timeout) when stuck.
++type raceServer struct {
++	name  string
++	wait  time.Duration
++	stuck bool
++	ips   []net.IP
++	err   error
++	asked atomic.Int32
++}
++
++func (s *raceServer) Name() string         { return s.name }
++func (s *raceServer) IsDisableCache() bool { return false }
++func (s *raceServer) QueryIP(ctx context.Context, _ string, _ feature_dns.IPOption) ([]net.IP, uint32, error) {
++	s.asked.Add(1)
++	wait := s.wait
++	if s.stuck {
++		wait = time.Hour
++	}
++	select {
++	case <-ctx.Done():
++		return nil, 0, ctx.Err()
++	case <-time.After(wait):
++	}
++	return s.ips, 60, s.err
++}
++
++func raceClient(server *raceServer, policy uint32) *Client {
++	return &Client{server: server, timeoutMs: 400 * time.Millisecond, policyID: policy, ipOption: &feature_dns.IPOption{IPv4Enable: true}}
++}
++
++func raceDNS(clients ...*Client) *DNS {
++	return &DNS{ctx: context.Background(), clients: clients, enableParallelQuery: true, ipOption: &feature_dns.IPOption{IPv4Enable: true}, hosts: &StaticHosts{}}
++}
++
++var (
++	raceOption = feature_dns.IPOption{IPv4Enable: true}
++	raceA      = []net.IP{{1, 2, 3, 4}}
++	raceB      = []net.IP{{5, 6, 7, 8}}
++)
++
++// Two connections to one resolver: the one that answers is used, and a stuck one costs nothing.
++func TestRaceTakesTheServerThatAnswers(t *testing.T) {
++	stuck := &raceServer{name: "stuck", stuck: true}
++	quick := &raceServer{name: "quick", wait: 10 * time.Millisecond, ips: raceA}
++	behind := &raceServer{name: "behind", ips: raceB}
++	server := raceDNS(raceClient(stuck, 1), raceClient(quick, 1), raceClient(behind, 2))
++
++	start := time.Now()
++	ips, _, err := server.parallelQuery("a.example", raceOption)
++	if err != nil || len(ips) != 1 || !ips[0].Equal(raceA[0]) {
++		t.Fatalf("got %v, %v", ips, err)
++	}
++	if took := time.Since(start); took > 200*time.Millisecond {
++		t.Errorf("took %v: waited for the stuck server", took)
++	}
++	if behind.asked.Load() != 0 {
++		t.Error("the next group was asked although the first had addresses")
++	}
++}
++
++// One DNS answer without usable addresses decides for its group: the stuck twin is not waited for.
++func TestRaceAnswerWithoutAddressesDecidesTheGroup(t *testing.T) {
++	for name, miss := range map[string]error{"empty": feature_dns.ErrEmptyResponse, "no such name": feature_dns.RCodeError(3), "nil": nil} {
++		t.Run(name, func(t *testing.T) {
++			stuck := &raceServer{name: "stuck", stuck: true}
++			answers := &raceServer{name: "answers", wait: 10 * time.Millisecond, err: miss}
++			behind := &raceServer{name: "behind", ips: raceB}
++			server := raceDNS(raceClient(stuck, 1), raceClient(answers, 1), raceClient(behind, 2))
++
++			start := time.Now()
++			ips, _, err := server.parallelQuery("a.example", raceOption)
++			if err != nil || len(ips) != 1 || !ips[0].Equal(raceB[0]) {
++				t.Fatalf("got %v, %v", ips, err)
++			}
++			if took := time.Since(start); took > 200*time.Millisecond {
++				t.Errorf("took %v: waited for the stuck server", took)
++			}
++		})
++	}
++}
++
++// A server that fails without a DNS answer (a timeout, a dead connection) does not decide: its twin does.
++func TestRaceWaitsForTheTwinOfAFailedServer(t *testing.T) {
++	dead := &raceServer{name: "dead", err: errors.New("dial failed")}
++	slow := &raceServer{name: "slow", wait: 60 * time.Millisecond, ips: raceA}
++	behind := &raceServer{name: "behind", ips: raceB}
++	server := raceDNS(raceClient(dead, 1), raceClient(slow, 1), raceClient(behind, 2))
++
++	ips, _, err := server.parallelQuery("a.example", raceOption)
++	if err != nil || len(ips) != 1 || !ips[0].Equal(raceA[0]) {
++		t.Fatalf("got %v, %v", ips, err)
++	}
++	if behind.asked.Load() != 0 {
++		t.Error("the next group was asked while a server of the first could still answer")
++	}
++}
++
++// Groups go in order, and a later group is asked only after the one before it has failed.
++func TestRaceAsksLaterGroupsOnlyAfterFailure(t *testing.T) {
++	first := &raceServer{name: "first", wait: 30 * time.Millisecond, err: feature_dns.RCodeError(3)}
++	second := &raceServer{name: "second", err: feature_dns.RCodeError(3)}
++	third := &raceServer{name: "third", ips: raceB}
++	server := raceDNS(raceClient(first, 1), raceClient(second, 2), raceClient(third, 3))
++
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		ips, _, err := server.parallelQuery("a.example", raceOption)
++		if err != nil || len(ips) != 1 || !ips[0].Equal(raceB[0]) {
++			t.Errorf("got %v, %v", ips, err)
++		}
++	}()
++	time.Sleep(10 * time.Millisecond)
++	if second.asked.Load() != 0 || third.asked.Load() != 0 {
++		t.Error("later groups were asked before the first had failed")
++	}
++	<-done
++	if first.asked.Load() != 1 || second.asked.Load() != 1 || third.asked.Load() != 1 {
++		t.Errorf("asked %d, %d, %d times, want once each", first.asked.Load(), second.asked.Load(), third.asked.Load())
++	}
++}
++
++// When every group fails, the last server that answered decides the code, as in serial order.
++func TestRaceAllFailedKeepsTheLastAnswer(t *testing.T) {
++	aside := &raceServer{name: "aside", err: feature_dns.ErrEmptyResponse}
++	stuck := &raceServer{name: "stuck", stuck: true}
++	gone := &raceServer{name: "gone", err: feature_dns.RCodeError(3)}
++	server := raceDNS(raceClient(aside, 1), raceClient(stuck, 1), raceClient(gone, 2))
++
++	_, _, err := server.parallelQuery("a.example", raceOption)
++	if got := feature_dns.RCodeFromError(err); got != 3 {
++		t.Fatalf("rcode %d, want 3 (%v)", got, err)
++	}
++}
 --- a/common/session/context.go
 +++ b/common/session/context.go
 @@ -202,3 +202,44 @@

@@ -98,11 +98,14 @@ type DefaultDispatcher struct {
 	policy policy.Manager
 	stats  stats.Manager
 	fdns   dns.FakeDNSEngine
+	// overrideSniffersOnly is what the context of the instance asks for, see WithOverrideSniffersOnly
+	overrideSniffersOnly bool
 }
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		d := new(DefaultDispatcher)
+		d.overrideSniffersOnly, _ = ctx.Value(overrideSniffersKey{}).(bool)
 		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, dc dns.Client) error {
 			core.OptionalFeatures(ctx, func(fdns dns.FakeDNSEngine) {
 				d.fdns = fdns
@@ -292,7 +295,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				reader: outbound.Reader.(*pipe.Reader),
 			}
 			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network, d.sniffersFor(sniffingRequest))
 			if err == nil {
 				content.Protocol = result.Protocol()
 			}
@@ -347,7 +350,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
 		outbound.Reader = cReader
-		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network, d.sniffersFor(sniffingRequest))
 		if err == nil {
 			content.Protocol = result.Protocol()
 		}
@@ -375,11 +378,23 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	return nil
 }
 
-func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
+// sniffersFor is the protocols whose content sniffers run for a request: nil for all of them, as in Xray.
+func (d *DefaultDispatcher) sniffersFor(request session.SniffingRequest) []string {
+	if !d.overrideSniffersOnly {
+		return nil
+	}
+	// never nil: an inbound that names no protocol runs no content sniffer
+	return append([]string{}, request.OverrideDestinationForProtocol...)
+}
+
+func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, only []string) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
 
 	sniffer := NewSniffer(ctx)
+	if only != nil {
+		sniffer.Only(only)
+	}
 
 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
 

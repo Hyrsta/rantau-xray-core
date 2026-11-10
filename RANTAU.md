@@ -2,9 +2,12 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.6` supplies the
-exact source built into the Rantau VPN apps from their releases after Android 0.1.78, macOS 0.2.67 and
-Windows 1.0.73, until a newer tag. It differs from `.5` only in the dial outcomes described below.
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.7` supplies the
+exact source built into the Rantau VPN apps from their releases after Android 0.1.81, macOS 0.2.69 and
+Windows 1.0.76, until a newer tag. It differs from `.6` in the raced lookups and the sniffer option
+described below. `v26.10.31-rantau.6` supplies the releases after Android 0.1.78, macOS 0.2.67 and
+Windows 1.0.73, up to and including Android 0.1.81, macOS 0.2.69 and Windows 1.0.76. It differs from `.5`
+only in the dial outcomes described below.
 `v26.10.31-rantau.5` supplies the releases after Android 0.1.61, macOS 0.2.50 and Windows 1.0.54, up to
 and including Android 0.1.78, macOS 0.2.67 and Windows 1.0.73. It differs from `v26.10.31-rantau.4` only in one comment in
 `proxy/vless/outbound/preconnect_policy.go`, which no longer names app versions. `v26.10.31-rantau.4`
@@ -24,6 +27,16 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **Lookups raced within a group, groups in order.** With `enableParallelQuery` the DNS app races the
+  servers of one group (equal `PolicyID`, next to each other) and asks the groups in order, a later one
+  only when the one before it has failed; the original asks every server of every group at once. The
+  first server with addresses wins, and one DNS answer without usable addresses (no such name, an empty
+  answer, an answer `expectedIPs` set aside) decides for its group at once, while a timeout or a failed
+  connection waits for the others.
+- **Only the sniffers an inbound asks for** (opt-in, per instance: `dispatcher.WithOverrideSniffersOnly`).
+  The dispatcher runs only the content sniffers of the protocols the inbound names in `destOverride`.
+  The original runs all of them, and a first datagram or payload under 20 bytes waited up to 200 ms
+  for the BitTorrent sniffers to tell. Metadata sniffers (FakeDNS) are kept.
 - **Dial outcomes.** The VLESS outbound tells one process-wide observer (`outbound.SetDialObserver`)
   the outcome of each dial to the server (TCP and REALITY), for the Rantau engine's early health check.
   No destinations or payloads are passed.

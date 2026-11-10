@@ -443,58 +443,70 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 	return nil, 0, mergeQueryErrors(domain, errs)
 }
 
+// parallelQuery races the servers of one group (equal PolicyID, next to each other) and takes the groups in
+// order, as serialQuery takes single servers. Xray asks every server of every group at once; here a later
+// group is asked only when the one before it has failed, so a name is not sent to servers that are only a
+// fallback for it. Within a group the first server with addresses wins. The servers of a group stand for the
+// same resolver, so one DNS answer without usable addresses (no such name, an empty answer, an answer
+// expectedIPs set aside) decides for the group at once: a second connection to the same resolver answers a
+// lookup the first one is stuck on, and a stuck one never holds back a name the other has already answered.
 func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
-
-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
-
-	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
-	results := make([]*queryResult, len(clients))
-	pending := make([]int, len(groups))
-	for gi, g := range groups {
-		pending[gi] = g.end - g.start + 1
+	groups, _ := makeGroups( /*s.ctx,*/ clients)
+	for _, g := range groups {
+		ips, ttl, groupErrs := s.raceGroup(domain, option, clients[g.start:g.end+1])
+		if len(ips) > 0 {
+			return ips, ttl, nil
+		}
+		errs = append(errs, groupErrs...)
 	}
+	return nil, 0, mergeQueryErrors(domain, errs)
+}
 
-	nextGroup := 0
-	for range clients {
-		result := <-resultsChan
-		results[result.index] = &result
-
-		gi := groupOf[result.index]
-		pending[gi]--
-
-		for nextGroup < len(groups) {
-			g := groups[nextGroup]
-
-			// group race, minimum rtt -> return
-			for j := g.start; j <= g.end; j++ {
-				r := results[j]
-				if r != nil && r.err == nil && len(r.ips) > 0 {
-					return r.ips, r.ttl, nil
-				}
-			}
-
-			// current group is incomplete and no one success -> continue pending
-			if pending[nextGroup] > 0 {
-				break
-			}
-
-			// all failed -> log and continue next group
-			for j := g.start; j <= g.end; j++ {
-				r := results[j]
-				e := r.err
-				if e == nil {
-					e = dns.ErrEmptyResponse
-				}
-				errors.LogInfoInner(s.ctx, e, "failed to lookup ip for domain ", domain, " at server ", clients[j].Name(), " in parallel query mode")
-				errs = append(errs, e)
-			}
-			nextGroup++
+// raceGroup asks every server of a group at once. It returns the first addresses, or the errors so far once
+// one server gave a DNS answer without addresses or all have failed. The decisive error comes last, where
+// mergeQueryErrors looks for the server that answered. Lookups still under way finish for the cache.
+func (s *DNS) raceGroup(domain string, option dns.IPOption, members []*Client) ([]net.IP, uint32, []error) {
+	var errs []error
+	failed := func(client *Client, err error) error {
+		if err == nil {
+			err = dns.ErrEmptyResponse
+		}
+		errors.LogInfoInner(s.ctx, err, "failed to lookup ip for domain ", domain, " at server ", client.Name(), " in parallel query mode")
+		errs = append(errs, err)
+		return err
+	}
+	if len(members) == 1 {
+		client := members[0]
+		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
+			errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
+			return nil, 0, nil
+		}
+		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+		if len(ips) > 0 {
+			return ips, ttl, nil
+		}
+		failed(client, err)
+		return nil, 0, errs
+	}
+	results := asyncQueryAll(domain, option, members, s.ctx)
+	for range members {
+		result := <-results
+		if result.err == nil && len(result.ips) > 0 {
+			return result.ips, result.ttl, nil
+		}
+		if err := failed(members[result.index], result.err); answered(err) {
+			break
 		}
 	}
+	return nil, 0, errs
+}
 
-	return nil, 0, mergeQueryErrors(domain, errs)
+// answered reports whether a failed lookup still carried a DNS answer: a response code, or a response
+// without usable addresses. A timeout or a failed connection did not.
+func answered(err error) bool {
+	return go_errors.Is(err, dns.ErrEmptyResponse) || dns.RCodeFromError(err) != 0
 }
 
 type queryResult struct {
