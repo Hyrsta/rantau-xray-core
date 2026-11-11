@@ -2,10 +2,12 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.7` supplies the
-exact source built into the Rantau VPN apps from their releases after Android 0.1.81, macOS 0.2.69 and
-Windows 1.0.76, until a newer tag. It differs from `.6` in the raced lookups and the sniffer option
-described below. `v26.10.31-rantau.6` supplies the releases after Android 0.1.78, macOS 0.2.67 and
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.8` supplies the
+exact source built into the Rantau VPN apps from their releases after Android 0.1.83, macOS 0.2.70 and
+Windows 1.0.77, until a newer tag. It differs from `.7` only in the site names option described below.
+`v26.10.31-rantau.7` supplies the releases after Android 0.1.81, macOS 0.2.69 and Windows 1.0.76, up to and
+including Android 0.1.83, macOS 0.2.70 and Windows 1.0.77. It differs from `.6` in the raced lookups and the
+sniffer option described below. `v26.10.31-rantau.6` supplies the releases after Android 0.1.78, macOS 0.2.67 and
 Windows 1.0.73, up to and including Android 0.1.81, macOS 0.2.69 and Windows 1.0.76. It differs from `.5`
 only in the dial outcomes described below.
 `v26.10.31-rantau.5` supplies the releases after Android 0.1.61, macOS 0.2.50 and Windows 1.0.54, up to
@@ -27,6 +29,11 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **Site names to the server** (opt-in, per instance: `outbound.WithSiteNames`). The VLESS client asks its
+  server for the name a TLS connection carries (the SNI that `routeOnly` sniffing read) instead of the IP
+  address the application connected to, so a server with IPv6 exits can reach the site over IPv6, with IPv4
+  as its fallback. Only TCP connections whose sniffed protocol is TLS change; everything else, and every
+  instance that does not opt in, is sent as in the original.
 - **Lookups raced within a group, groups in order.** With `enableParallelQuery` the DNS app races the
   servers of one group (equal `PolicyID`, next to each other) and asks the groups in order, a later one
   only when the one before it has failed; the original asks every server of every group at once. The

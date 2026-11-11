@@ -53,6 +53,8 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
+	siteNames bool // WithSiteNames: ask the server for a TLS connection's sniffed name
+
 	testpre   uint32
 	preMu     sync.Mutex
 	prePool   *preconnectPool
@@ -74,6 +76,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
+		siteNames:     siteNamesEnabled(ctx),
 	}
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)
@@ -180,7 +183,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 
 	iConn := stat.TryUnwrapStatsConn(conn)
-	target := ob.Target
+	target := requestTarget(ctx, h.siteNames, ob)
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	if h.encryption != nil {

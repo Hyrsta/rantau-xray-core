@@ -2205,28 +2205,35 @@
  	"github.com/xtls/xray-core/common/errors"
  	"github.com/xtls/xray-core/common/mux"
  	"github.com/xtls/xray-core/common/net"
-@@ -54,16 +53,12 @@
+@@ -54,14 +53,12 @@
  	encryption    *encryption.ClientInstance
  	reverse       *Reverse
  
 -	testpre  uint32
 -	initpre  sync.Once
 -	preConns chan *ConnExpire
+-}
++	siteNames bool // WithSiteNames: ask the server for a TLS connection's sniffed name
+ 
+-type ConnExpire struct {
+-	Conn   stat.Connection
+-	Expire time.Time
 +	testpre   uint32
 +	preMu     sync.Mutex
 +	prePool   *preconnectPool
 +	preClosed bool
  }
  
--type ConnExpire struct {
--	Conn   stat.Connection
--	Expire time.Time
--}
--
  // New creates a new VLess outbound handler.
- func New(ctx context.Context, config *Config) (*Handler, error) {
- 	if config.Vnext == nil {
-@@ -133,8 +128,12 @@
+@@ -79,6 +76,7 @@
+ 		server:        server,
+ 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+ 		cone:          ctx.Value("cone").(bool),
++		siteNames:     siteNamesEnabled(ctx),
+ 	}
+ 
+ 	a := handler.server.User.Account.(*vless.MemoryAccount)
+@@ -133,8 +131,12 @@
  
  // Close implements common.Closable.Close().
  func (h *Handler) Close() error {
@@ -2241,7 +2248,7 @@
  	}
  	if h.reverse != nil {
  		return h.reverse.Close()
-@@ -152,44 +151,24 @@
+@@ -152,44 +154,24 @@
  	ob.Name = "vless"
  
  	rec := h.server
@@ -2296,7 +2303,16 @@
  			if err != nil {
  				return err
  			}
-@@ -474,4 +453,9 @@
+@@ -201,7 +183,7 @@
+ 	defer conn.Close()
+ 
+ 	iConn := stat.TryUnwrapStatsConn(conn)
+-	target := ob.Target
++	target := requestTarget(ctx, h.siteNames, ob)
+ 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
+ 
+ 	if h.encryption != nil {
+@@ -474,4 +456,9 @@
  
  func (r *Reverse) Close() error {
  	return r.monitorTask.Close()
@@ -3042,6 +3058,119 @@
 +	time.Sleep(100 * time.Millisecond)
 +	if calls.Load() != settled || readyCount(p) != 0 {
 +		t.Fatalf("idle pool kept dialing after the warm window: %d -> %d, ready %d", settled, calls.Load(), readyCount(p))
++	}
++}
+--- /dev/null
++++ b/proxy/vless/outbound/site_names.go
+@@ -0,0 +1,46 @@
++package outbound
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++)
++
++type siteNamesKey struct{}
++
++// WithSiteNames makes the VLESS outbounds of an instance built with this context ask their server
++// for the site a TLS connection names (its SNI, read by routeOnly sniffing) instead of the address
++// the app connected to. The server then looks the name up itself, so a server with IPv6 exits can
++// reach the site over IPv6, with IPv4 as its fallback, although the app connected over IPv4.
++// Only TCP connections whose sniffed protocol is TLS change; everything else is sent as before.
++// Other users of this Xray copy keep normal behavior unless they opt in.
++func WithSiteNames(ctx context.Context) context.Context {
++	return context.WithValue(ctx, siteNamesKey{}, true)
++}
++
++func siteNamesEnabled(ctx context.Context) bool {
++	enabled, _ := ctx.Value(siteNamesKey{}).(bool)
++	return enabled
++}
++
++// requestTarget is the destination asked of the server: the sniffed TLS name in place of an IP
++// address when site names are on, otherwise the target itself.
++func requestTarget(ctx context.Context, siteNames bool, ob *session.Outbound) net.Destination {
++	target := ob.Target
++	if !siteNames || target.Network != net.Network_TCP || target.Address == nil || !target.Address.Family().IsIP() {
++		return target
++	}
++	name := ob.RouteTarget.Address
++	if name == nil || !name.Family().IsDomain() || len(name.Domain()) > 253 {
++		return target
++	}
++	// Names the protocol itself uses (mux, reverse) would change the request's meaning.
++	if candidate := (net.Destination{Address: name}); isMuxTarget(candidate) {
++		return target
++	}
++	if content := session.ContentFromContext(ctx); content == nil || content.Protocol != "tls" {
++		return target
++	}
++	return net.Destination{Network: net.Network_TCP, Address: name, Port: target.Port}
++}
+--- /dev/null
++++ b/proxy/vless/outbound/site_names_test.go
+@@ -0,0 +1,61 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++)
++
++func TestRequestTargetSendsSniffedTLSNameOnlyWhenAskedTo(t *testing.T) {
++	ip := net.TCPDestination(net.ParseAddress("198.51.100.10"), 443)
++	named := net.TCPDestination(net.DomainAddress("www.youtube.com"), 443)
++	for _, c := range []struct {
++		name      string
++		siteNames bool
++		protocol  string
++		target    net.Destination
++		route     net.Destination
++		want      net.Destination
++	}{
++		{"tls", true, "tls", ip, named, named},
++		{"tlsOtherPort", true, "tls", net.TCPDestination(net.ParseAddress("198.51.100.10"), 8443),
++			net.TCPDestination(net.DomainAddress("www.youtube.com"), 8443), net.TCPDestination(net.DomainAddress("www.youtube.com"), 8443)},
++		{"ipv6Target", true, "tls", net.TCPDestination(net.ParseAddress("2001:db8::10"), 443), named, named},
++		{"off", false, "tls", ip, named, ip},
++		{"http", true, "http", net.TCPDestination(net.ParseAddress("198.51.100.10"), 80),
++			net.TCPDestination(net.DomainAddress("example.com"), 80), net.TCPDestination(net.ParseAddress("198.51.100.10"), 80)},
++		{"notSniffed", true, "", ip, net.Destination{}, ip},
++		{"sniffedIP", true, "tls", ip, net.TCPDestination(net.ParseAddress("203.0.113.7"), 443), ip},
++		{"udp", true, "quic", net.UDPDestination(net.ParseAddress("198.51.100.10"), 443),
++			net.UDPDestination(net.DomainAddress("www.youtube.com"), 443), net.UDPDestination(net.ParseAddress("198.51.100.10"), 443)},
++		{"alreadyName", true, "tls", named, net.TCPDestination(net.DomainAddress("other.example"), 443), named},
++		{"mux", true, "tls", ip, net.TCPDestination(net.DomainAddress("v1.mux.cool"), 443), ip},
++		{"reverse", true, "tls", ip, net.TCPDestination(net.DomainAddress("v1.rvs.cool"), 443), ip},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			ctx := session.ContextWithContent(context.Background(), &session.Content{Protocol: c.protocol})
++			ob := &session.Outbound{Target: c.target, RouteTarget: c.route}
++			if got := requestTarget(ctx, c.siteNames, ob); got != c.want {
++				t.Fatalf("got %v, want %v", got, c.want)
++			}
++			if ob.Target != c.target {
++				t.Fatalf("the routed target changed to %v", ob.Target)
++			}
++		})
++	}
++	ob := &session.Outbound{Target: ip, RouteTarget: named}
++	if got := requestTarget(context.Background(), true, ob); got != ip {
++		t.Fatalf("without content: got %v", got)
++	}
++}
++
++func TestSiteNamesOnlyForInstancesThatAskForIt(t *testing.T) {
++	if siteNamesEnabled(context.Background()) {
++		t.Fatal("on without WithSiteNames")
++	}
++	if !siteNamesEnabled(WithSiteNames(context.Background())) {
++		t.Fatal("off with WithSiteNames")
 +	}
 +}
 --- /dev/null
