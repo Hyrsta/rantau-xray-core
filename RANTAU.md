@@ -2,9 +2,10 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.8` supplies the
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.9` supplies the
 exact source built into the Rantau VPN apps from their releases after Android 0.1.83, macOS 0.2.70 and
-Windows 1.0.77, until a newer tag. It differs from `.7` only in the site names option described below.
+Windows 1.0.77, until a newer tag. It differs from `.8` only in the kept interface answer described below.
+`v26.10.31-rantau.8` (the site names option described below) was built into no release.
 `v26.10.31-rantau.7` supplies the releases after Android 0.1.81, macOS 0.2.69 and Windows 1.0.76, up to and
 including Android 0.1.83, macOS 0.2.70 and Windows 1.0.77. It differs from `.6` in the raced lookups and the
 sniffer option described below. `v26.10.31-rantau.6` supplies the releases after Android 0.1.78, macOS 0.2.67 and
@@ -29,6 +30,11 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **The interface answer is kept** (`transport/internet/interface_cache.go`). A dial bound to a network interface
+  looked the interface up by name every time; on Windows that lists every adapter of the computer and took tens to
+  hundreds of milliseconds per connection. The answer is now kept: used as it is for 10 s, then used at once while
+  it is looked up again behind the dial, and looked up first again after 60 s without a bound dial. A failed lookup
+  or a refused socket option drops it. Only `sockopt_windows.go` uses it.
 - **Site names to the server** (opt-in, per instance: `outbound.WithSiteNames`). The VLESS client asks its
   server for the name a TLS connection carries (the SNI that `routeOnly` sniffing read) instead of the IP
   address the application connected to, so a server with IPv6 exits can reach the site over IPv6, with IPv4

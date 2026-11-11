@@ -33,7 +33,8 @@ func setTFO(fd syscall.Handle, tfo int) error {
 
 func applyOutboundSocketOptions(network string, address string, fd uintptr, config *SocketConfig) error {
 	if config.Interface != "" {
-		inf, err := net.InterfaceByName(config.Interface)
+		// Rantau: the kept answer (interface_cache.go); the list of adapters is slow on Windows.
+		inf, err := interfaceByName(config.Interface)
 		if err != nil {
 			return NewBindError(errors.New("failed to find the interface").Base(err))
 		}
@@ -47,6 +48,7 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			binary.BigEndian.PutUint32(bytes[:], uint32(inf.Index))
 			idx := *(*uint32)(unsafe.Pointer(&bytes[0]))
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, IP_UNICAST_IF, int(idx)); err != nil {
+				forgetInterface(config.Interface)
 				return NewBindError(errors.New("failed to set IP_UNICAST_IF").Base(err))
 			}
 			if ip := net.ParseIP(host); ip != nil && ip.IsMulticast() && isUDPSocket(network) {
@@ -56,6 +58,7 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			}
 		} else {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IPV6, IPV6_UNICAST_IF, inf.Index); err != nil {
+				forgetInterface(config.Interface)
 				return NewBindError(errors.New("failed to set IPV6_UNICAST_IF").Base(err))
 			}
 			if ip := net.ParseIP(host); ip != nil && ip.IsMulticast() && isUDPSocket(network) {
