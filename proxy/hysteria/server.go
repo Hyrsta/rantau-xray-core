@@ -59,6 +59,11 @@ func (s *Server) HysteriaInboundValidator() *account.Validator {
 	return s.validator
 }
 
+// ListenContext gives the inbound's listener the validator of this server's users (app/proxyman/inbound).
+func (s *Server) ListenContext(ctx context.Context) context.Context {
+	return hysteria.ContextWithValidator(ctx, s.HysteriaInboundValidator())
+}
+
 func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
 	return s.validator.Add(user)
 }

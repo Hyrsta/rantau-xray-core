@@ -4,7 +4,6 @@ package common
 
 import (
 	"fmt"
-	"go/build"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -82,45 +81,8 @@ func GetRuntimeEnv(key string) (string, error) {
 	return runtimeEnv, nil
 }
 
-// GetGOBIN returns GOBIN environment variable as a string. It will NOT be empty.
-func GetGOBIN() string {
-	// The one set by user explicitly by `export GOBIN=/path` or `env GOBIN=/path command`
-	GOBIN := os.Getenv("GOBIN")
-	if GOBIN == "" {
-		var err error
-		// The one set by user by running `go env -w GOBIN=/path`
-		GOBIN, err = GetRuntimeEnv("GOBIN")
-		if err != nil {
-			// The default one that Golang uses
-			return filepath.Join(build.Default.GOPATH, "bin")
-		}
-		if GOBIN == "" {
-			return filepath.Join(build.Default.GOPATH, "bin")
-		}
-		return GOBIN
-	}
-	return GOBIN
-}
-
-// GetGOPATH returns GOPATH environment variable as a string. It will NOT be empty.
-func GetGOPATH() string {
-	// The one set by user explicitly by `export GOPATH=/path` or `env GOPATH=/path command`
-	GOPATH := os.Getenv("GOPATH")
-	if GOPATH == "" {
-		var err error
-		// The one set by user by running `go env -w GOPATH=/path`
-		GOPATH, err = GetRuntimeEnv("GOPATH")
-		if err != nil {
-			// The default one that Golang uses
-			return build.Default.GOPATH
-		}
-		if GOPATH == "" {
-			return build.Default.GOPATH
-		}
-		return GOPATH
-	}
-	return GOPATH
-}
+// Rantau: GetGOBIN and GetGOPATH, which nothing calls, are left out: they linked go/build (and its
+// parser) into every program, and build.Default ran its setup at start.
 
 // GetModuleName returns the value of module in `go.mod` file.
 func GetModuleName(pathToProjectRoot string) (string, error) {

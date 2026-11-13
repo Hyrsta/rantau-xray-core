@@ -1,3 +1,5 @@
+//go:build xray_doq
+
 package dns
 
 import (

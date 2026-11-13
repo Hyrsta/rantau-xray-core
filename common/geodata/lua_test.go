@@ -1,3 +1,5 @@
+//go:build xray_lua
+
 package geodata
 
 import (

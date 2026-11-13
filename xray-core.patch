@@ -383,6 +383,30 @@
  }
  
  type queryResult struct {
+--- a/app/dns/lua.go
++++ b/app/dns/lua.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package dns
+ 
+ import (
+--- a/app/dns/lua_benchmark_test.go
++++ b/app/dns/lua_benchmark_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package dns
+ 
+ import (
+--- a/app/dns/lua_test.go
++++ b/app/dns/lua_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package dns
+ 
+ import (
 --- /dev/null
 +++ b/app/dns/merge_errors_test.go
 @@ -0,0 +1,51 @@
@@ -527,6 +551,67 @@
  // Name implements Server.
  func (s *DoHNameServer) Name() string {
  	return s.cacheController.name
+--- a/app/dns/nameserver_quic.go
++++ b/app/dns/nameserver_quic.go
+@@ -1,3 +1,5 @@
++//go:build xray_doq
++
+ package dns
+ 
+ import (
+--- /dev/null
++++ b/app/dns/nameserver_quic_off.go
+@@ -0,0 +1,21 @@
++//go:build !xray_doq
++
++package dns
++
++import (
++	"net/url"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++)
++
++// Rantau: DNS over QUIC ("quic+local://" servers) is left out unless built with -tags xray_doq, so the
++// DNS app does not link QUIC. A configuration with such a server fails to start instead of skipping it.
++
++// QUICNameServer stands in for the DNS over QUIC client, which is not built in.
++type QUICNameServer struct{ Server }
++
++// NewQUICNameServer refuses: DNS over QUIC is not built in.
++func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*QUICNameServer, error) {
++	return nil, errors.New("DNS over QUIC is not built into this copy of Xray (build with -tags xray_doq): ", url.String())
++}
+--- /dev/null
++++ b/app/dns/nameserver_quic_off_test.go
+@@ -0,0 +1,18 @@
++//go:build !xray_doq
++
++package dns
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++)
++
++// Without the xray_doq tag a DNS over QUIC server must fail to be created, not be skipped.
++func TestQUICNeedsTheDoqTag(t *testing.T) {
++	dest := net.Destination{Network: net.Network_UDP, Address: net.DomainAddress("quic+local://1.1.1.1"), Port: 853}
++	if _, err := NewServer(context.Background(), dest, nil, false, false, 0, nil); err == nil {
++		t.Fatal("NewServer made a DNS over QUIC server; want an error")
++	}
++}
+--- a/app/dns/nameserver_quic_test.go
++++ b/app/dns/nameserver_quic_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_doq
++
+ package dns_test
+ 
+ import (
 --- a/app/dns/nameserver_udp.go
 +++ b/app/dns/nameserver_udp.go
 @@ -59,6 +59,13 @@
@@ -693,6 +778,299 @@
 +		t.Fatalf("rcode %d, want 3 (%v)", got, err)
 +	}
 +}
+--- a/app/dns/script.go
++++ b/app/dns/script.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package dns
+ 
+ import (
+--- /dev/null
++++ b/app/dns/script_off.go
+@@ -0,0 +1,27 @@
++//go:build !xray_lua
++
++package dns
++
++import (
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/features/dns"
++)
++
++// Rantau: DNS scripts (Lua) are left out unless built with -tags xray_lua. Lua's reflection makes the
++// linker keep every exported method of every type, so it costs more than its own size. A configuration
++// with a script fails to start instead of running without it.
++
++type scriptEngine struct{}
++
++func newScriptEngine(string) (*scriptEngine, error) {
++	return nil, errors.New("DNS scripts are not built into this copy of Xray (build with -tags xray_lua)")
++}
++
++func (*scriptEngine) start(*DNS) error { return nil }
++
++func (*scriptEngine) close() {}
++
++func (*scriptEngine) query(string, dns.IPOption) ([]net.IP, uint32, error) {
++	return nil, 0, errors.New("DNS scripts are not built into this copy of Xray")
++}
+--- /dev/null
++++ b/app/dns/script_off_test.go
+@@ -0,0 +1,18 @@
++//go:build !xray_lua
++
++package dns
++
++import (
++	"context"
++	"testing"
++)
++
++// Without the xray_lua tag a configuration that asks for a DNS script must fail to start, not run without it.
++func TestScriptNeedsTheLuaTag(t *testing.T) {
++	if server, err := New(context.Background(), &Config{Script: "dns.lua"}); err == nil || server != nil {
++		t.Fatalf("New with a script: %v, %v; want an error", server, err)
++	}
++	if _, err := New(context.Background(), &Config{}); err != nil {
++		t.Fatalf("New without a script: %v", err)
++	}
++}
+--- a/app/dns/script_test.go
++++ b/app/dns/script_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package dns
+ 
+ import (
+--- a/app/proxyman/inbound/worker.go
++++ b/app/proxyman/inbound/worker.go
+@@ -18,9 +18,7 @@
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/features/stats"
+ 	"github.com/xtls/xray-core/proxy"
+-	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
+ 	"github.com/xtls/xray-core/transport/internet"
+-	"github.com/xtls/xray-core/transport/internet/hysteria"
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ 	"github.com/xtls/xray-core/transport/internet/tcp"
+ 	"github.com/xtls/xray-core/transport/internet/udp"
+@@ -131,11 +129,18 @@
+ 	return w.proxy
+ }
+ 
++// listenContexter is an inbound whose listener needs something from it in its context (Hysteria: the
++// validator of its users). Rantau: an interface instead of Hysteria's type, so this package does not link
++// Hysteria and QUIC into every program that has inbounds.
++type listenContexter interface {
++	ListenContext(ctx context.Context) context.Context
++}
++
+ func (w *tcpWorker) Start() error {
+ 	ctx := context.Background()
+ 
+-	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
+-		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
++	if v, ok := w.proxy.(listenContexter); ok {
++		ctx = v.ListenContext(ctx)
+ 	}
+ 
+ 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
+--- /dev/null
++++ b/app/proxyman/inbound/worker_test.go
+@@ -0,0 +1,9 @@
++package inbound
++
++import (
++	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
++)
++
++// Rantau: a Hysteria inbound must still hand its listener the validator of its users (worker.go). The
++// check lives in a test so that the package itself does not link Hysteria and QUIC.
++var _ listenContexter = (*hysteria_proxy.Server)(nil)
+--- a/app/router/lua.go
++++ b/app/router/lua.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package router
+ 
+ import (
+--- a/app/router/lua_benchmark_test.go
++++ b/app/router/lua_benchmark_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package router
+ 
+ import (
+--- a/app/router/lua_test.go
++++ b/app/router/lua_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package router
+ 
+ import (
+--- a/app/router/script.go
++++ b/app/router/script.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package router
+ 
+ import (
+--- /dev/null
++++ b/app/router/script_off.go
+@@ -0,0 +1,25 @@
++//go:build !xray_lua
++
++package router
++
++import (
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/features/routing"
++)
++
++// Rantau: routing scripts (Lua) are left out unless built with -tags xray_lua (see app/dns/script_off.go).
++// A configuration with a script fails to start instead of routing without it.
++
++type scriptEngine struct{}
++
++func newScriptEngine(string) (*scriptEngine, error) {
++	return nil, errors.New("routing scripts are not built into this copy of Xray (build with -tags xray_lua)")
++}
++
++func (*scriptEngine) start(*Router) error { return nil }
++
++func (*scriptEngine) close() {}
++
++func (*scriptEngine) pickRoute(routing.Context) (routing.Route, error) {
++	return nil, errors.New("routing scripts are not built into this copy of Xray")
++}
+--- /dev/null
++++ b/app/router/script_off_test.go
+@@ -0,0 +1,19 @@
++//go:build !xray_lua
++
++package router
++
++import (
++	"context"
++	"testing"
++)
++
++// Without the xray_lua tag a configuration that asks for a routing script must fail to start, not route without it.
++func TestScriptNeedsTheLuaTag(t *testing.T) {
++	r := new(Router)
++	if err := r.Init(context.Background(), &Config{Script: "route.lua"}, nil, nil, nil); err == nil {
++		t.Fatal("Init with a script succeeded; want an error")
++	}
++	if r.script != nil {
++		t.Fatal("the router kept a script engine")
++	}
++}
+--- a/app/router/script_test.go
++++ b/app/router/script_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package router
+ 
+ import (
+--- a/common/common.go
++++ b/common/common.go
+@@ -4,7 +4,6 @@
+ 
+ import (
+ 	"fmt"
+-	"go/build"
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
+@@ -82,46 +81,9 @@
+ 	return runtimeEnv, nil
+ }
+ 
+-// GetGOBIN returns GOBIN environment variable as a string. It will NOT be empty.
+-func GetGOBIN() string {
+-	// The one set by user explicitly by `export GOBIN=/path` or `env GOBIN=/path command`
+-	GOBIN := os.Getenv("GOBIN")
+-	if GOBIN == "" {
+-		var err error
+-		// The one set by user by running `go env -w GOBIN=/path`
+-		GOBIN, err = GetRuntimeEnv("GOBIN")
+-		if err != nil {
+-			// The default one that Golang uses
+-			return filepath.Join(build.Default.GOPATH, "bin")
+-		}
+-		if GOBIN == "" {
+-			return filepath.Join(build.Default.GOPATH, "bin")
+-		}
+-		return GOBIN
+-	}
+-	return GOBIN
+-}
++// Rantau: GetGOBIN and GetGOPATH, which nothing calls, are left out: they linked go/build (and its
++// parser) into every program, and build.Default ran its setup at start.
+ 
+-// GetGOPATH returns GOPATH environment variable as a string. It will NOT be empty.
+-func GetGOPATH() string {
+-	// The one set by user explicitly by `export GOPATH=/path` or `env GOPATH=/path command`
+-	GOPATH := os.Getenv("GOPATH")
+-	if GOPATH == "" {
+-		var err error
+-		// The one set by user by running `go env -w GOPATH=/path`
+-		GOPATH, err = GetRuntimeEnv("GOPATH")
+-		if err != nil {
+-			// The default one that Golang uses
+-			return build.Default.GOPATH
+-		}
+-		if GOPATH == "" {
+-			return build.Default.GOPATH
+-		}
+-		return GOPATH
+-	}
+-	return GOPATH
+-}
+-
+ // GetModuleName returns the value of module in `go.mod` file.
+ func GetModuleName(pathToProjectRoot string) (string, error) {
+ 	var moduleName string
+--- a/common/geodata/lua.go
++++ b/common/geodata/lua.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package geodata
+ 
+ import (
+--- a/common/geodata/lua_test.go
++++ b/common/geodata/lua_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package geodata
+ 
+ import (
+--- a/common/log/lua.go
++++ b/common/log/lua.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package log
+ 
+ import (
+--- a/common/log/lua_test.go
++++ b/common/log/lua_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package log
+ 
+ import (
 --- a/common/session/context.go
 +++ b/common/session/context.go
 @@ -202,3 +202,44 @@
@@ -897,6 +1275,44 @@
 +		t.Fatal("a blocked UDP flow opened after the close kept waiting")
 +	}
 +}
+--- /dev/null
++++ b/proxy/hysteria/listen_context_test.go
+@@ -0,0 +1,21 @@
++package hysteria
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/proxy/hysteria/account"
++	"github.com/xtls/xray-core/transport/internet/hysteria"
++)
++
++// Rantau: app/proxyman/inbound gives a Hysteria inbound's listener its users through ListenContext (an
++// interface there, so the inbound package does not link Hysteria), as it did through the Server type.
++func TestListenContextCarriesTheValidator(t *testing.T) {
++	validator := account.NewValidator()
++	var inbound interface {
++		ListenContext(context.Context) context.Context
++	} = &Server{validator: validator}
++	if got := hysteria.ValidatorFromContext(inbound.ListenContext(context.Background())); got != validator {
++		t.Fatalf("validator in the listener's context = %p, want %p", got, validator)
++	}
++}
+--- a/proxy/hysteria/server.go
++++ b/proxy/hysteria/server.go
+@@ -59,6 +59,11 @@
+ 	return s.validator
+ }
+ 
++// ListenContext gives the inbound's listener the validator of this server's users (app/proxyman/inbound).
++func (s *Server) ListenContext(ctx context.Context) context.Context {
++	return hysteria.ContextWithValidator(ctx, s.HysteriaInboundValidator())
++}
++
+ func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
+ 	return s.validator.Add(user)
+ }
 --- a/proxy/tun/handler.go
 +++ b/proxy/tun/handler.go
 @@ -4,6 +4,7 @@
@@ -3236,6 +3652,68 @@
 +		})
 +	}
 +}
+--- a/transport/internet/finalmask/noise/lua.go
++++ b/transport/internet/finalmask/noise/lua.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package noise
+ 
+ import (
+--- a/transport/internet/finalmask/noise/lua_benchmark_test.go
++++ b/transport/internet/finalmask/noise/lua_benchmark_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package noise
+ 
+ import "testing"
+--- a/transport/internet/finalmask/noise/script.go
++++ b/transport/internet/finalmask/noise/script.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package noise
+ 
+ import (
+--- /dev/null
++++ b/transport/internet/finalmask/noise/script_off.go
+@@ -0,0 +1,27 @@
++//go:build !xray_lua
++
++package noise
++
++import (
++	"time"
++
++	"github.com/xtls/xray-core/common/errors"
++)
++
++// Rantau: noise scripts (Lua) are left out unless built with -tags xray_lua (see app/dns/script_off.go).
++// A mask with a script fails to start instead of sending no noise.
++
++type scriptEngine struct{}
++
++type scriptPacket struct {
++	packet []byte
++	delay  time.Duration
++}
++
++func (c *Config) engine() (*scriptEngine, error) {
++	return nil, errors.New("noise scripts are not built into this copy of Xray (build with -tags xray_lua)")
++}
++
++func (*scriptEngine) packets(string, []scriptPacket) ([]scriptPacket, error) {
++	return nil, errors.New("noise scripts are not built into this copy of Xray")
++}
+--- a/transport/internet/finalmask/noise/script_test.go
++++ b/transport/internet/finalmask/noise/script_test.go
+@@ -1,3 +1,5 @@
++//go:build xray_lua
++
+ package noise
+ 
+ import (
 --- /dev/null
 +++ b/transport/internet/interface_cache.go
 @@ -0,0 +1,81 @@
@@ -3591,3 +4069,506 @@
  				return NewBindError(errors.New("failed to set IPV6_UNICAST_IF").Base(err))
  			}
  			if ip := net.ParseIP(host); ip != nil && ip.IsMulticast() && isUDPSocket(network) {
+--- a/transport/internet/tls/ech.go
++++ b/transport/internet/tls/ech.go
+@@ -1,26 +1,17 @@
+ package tls
+ 
+ import (
+-	"bytes"
+ 	"context"
+ 	"crypto/tls"
+ 	"encoding/base64"
+ 	"encoding/binary"
+ 	"fmt"
+-	"io"
+ 	"net/http"
+-	"net/url"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+-	utls "github.com/refraction-networking/utls"
+-	"github.com/xtls/xray-core/common/crypto"
+-	"github.com/xtls/xray-core/common/session"
+-	"golang.org/x/net/http2"
+-
+-	"github.com/miekg/dns"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/utils"
+@@ -167,154 +158,7 @@
+ 			}()
+ 		}
+ 		return configRecord.config, nil
+-	}
+-}
+-
+-// dnsQuery is the real func for sending type65 query for given domain to given DNS server.
+-// return ECH config, TTL and error
+-func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
+-	m := new(dns.Msg)
+-	var dnsResolve []byte
+-	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
+-	// for DOH server
+-	if strings.HasPrefix(server, "https://") || strings.HasPrefix(server, "h2c://") {
+-		h2c := strings.HasPrefix(server, "h2c://")
+-		m.SetEdns0(4096, false) // 4096 is the buffer size, false means no DNSSEC
+-		padding := &dns.EDNS0_PADDING{Padding: make([]byte, int(crypto.RandBetween(100, 300)))}
+-		if opt := m.IsEdns0(); opt != nil {
+-			opt.Option = append(opt.Option, padding)
+-		}
+-		// always 0 in DOH
+-		m.Id = 0
+-		msg, err := m.Pack()
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		var client *http.Client
+-		serverKey := ECHCacheKey(server, "", sockopt)
+-		if client, _ = clientForECHDOH.Load(serverKey); client == nil {
+-			// All traffic sent by core should via xray's internet.DialSystem
+-			// This involves the behavior of some Android VPN GUI clients
+-			tr := &http2.Transport{
+-				IdleConnTimeout: net.ConnIdleTimeout,
+-				ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
+-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+-					host, _, err := net.SplitHostPort(addr)
+-					if err != nil {
+-						return nil, err
+-					}
+-					dest, err := net.ParseDestination(network + ":" + addr)
+-					if err != nil {
+-						return nil, err
+-					}
+-					dnsCtx := ctx
+-					if h2c {
+-						dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false) // for insurance
+-						dnsCtx = session.ContextWithMitmServerName(dnsCtx, host)
+-					}
+-					var conn net.Conn
+-					conn, err = internet.DialSystem(dnsCtx, dest, sockopt)
+-					if err != nil {
+-						return nil, err
+-					}
+-
+-					if !h2c {
+-						conn = utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+-						if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
+-							return nil, err
+-						}
+-					}
+-					return conn, nil
+-				},
+-			}
+-			c := &http.Client{
+-				Timeout:   30 * time.Second,
+-				Transport: tr,
+-			}
+-			client, _ = clientForECHDOH.LoadOrStore(serverKey, c)
+-		}
+-		req, err := http.NewRequest("POST", server, bytes.NewReader(msg))
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		// h2c: in config is just for claim
+-		// change scheme to https and expect outbound to handle TLS (freedom + tlsSetting)
+-		req.URL.Scheme = "https"
+-		req.Header.Set("Accept", "application/dns-message")
+-		req.Header.Set("Content-Type", "application/dns-message")
+-		utils.TryDefaultHeadersWith(req.Header, "fetch")
+-		req.Header.Set("X-Padding", utils.H2Base62Pad(crypto.RandBetween(100, 1000)))
+-
+-		resp, err := client.Do(req)
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		defer resp.Body.Close()
+-		respBody, err := io.ReadAll(resp.Body)
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		if resp.StatusCode != http.StatusOK {
+-			return nil, 0, errors.New("query failed with response code:", resp.StatusCode)
+-		}
+-		dnsResolve = respBody
+-	} else if strings.HasPrefix(server, "udp://") { // for classic udp dns server
+-		udpServerURL, err := url.Parse(server)
+-		if err != nil {
+-			return nil, 0, errors.New("failed to parse udp dns server ", server, " for ECH: ", err)
+-		}
+-		// default port 53 if not specified
+-		if udpServerURL.Port() == "" {
+-			udpServerURL.Host = udpServerURL.Host + ":53"
+-		}
+-		dest, err := net.ParseDestination("udp" + ":" + udpServerURL.Host)
+-		if err != nil {
+-			return nil, 0, errors.New("failed to parse udp dns server ", udpServerURL.Host, " for ECH: ", err)
+-		}
+-		dnsTimeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+-		defer cancel()
+-		// use xray's internet.DialSystem as mentioned above
+-		conn, err := internet.DialSystem(dnsTimeoutCtx, dest, sockopt)
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		defer func() {
+-			err := conn.Close()
+-			if err != nil {
+-				errors.LogDebug(context.Background(), "Failed to close connection: ", err)
+-			}
+-		}()
+-		msg, err := m.Pack()
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		conn.Write(msg)
+-		udpResponse := make([]byte, 512)
+-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+-		_, err = conn.Read(udpResponse)
+-		if err != nil {
+-			return nil, 0, err
+-		}
+-		dnsResolve = udpResponse
+ 	}
+-	respMsg := new(dns.Msg)
+-	err := respMsg.Unpack(dnsResolve)
+-	if err != nil {
+-		return nil, 0, errors.New("failed to unpack dns response for ECH: ", err)
+-	}
+-	if len(respMsg.Answer) > 0 {
+-		for _, answer := range respMsg.Answer {
+-			if https, ok := answer.(*dns.HTTPS); ok && https.Hdr.Name == dns.Fqdn(domain) {
+-				for _, v := range https.Value {
+-					if echConfig, ok := v.(*dns.SVCBECHConfig); ok {
+-						errors.LogDebug(context.Background(), "Get ECH config:", echConfig.String(), " TTL:", respMsg.Answer[0].Header().Ttl)
+-						return echConfig.ECH, answer.Header().Ttl, nil
+-					}
+-				}
+-			}
+-		}
+-	}
+-	return nil, 0, errors.New("no valid ECH config found in DNS response")
+ }
+ 
+ var ErrInvalidLen = errors.New("goech: invalid length")
+--- /dev/null
++++ b/transport/internet/tls/ech_dns.go
+@@ -0,0 +1,174 @@
++//go:build xray_ech_dns
++
++package tls
++
++import (
++	"bytes"
++	"context"
++	"crypto/tls"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++
++	"github.com/miekg/dns"
++	utls "github.com/refraction-networking/utls"
++	"github.com/xtls/xray-core/common/crypto"
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/utils"
++	"github.com/xtls/xray-core/transport/internet"
++	"golang.org/x/net/http2"
++)
++
++// Rantau: moved from ech.go unchanged, so that only a copy built with -tags xray_ech_dns links a DNS
++// library (miekg/dns) for ECH configs looked up over DNS (ech_dns_off.go stands in otherwise).
++
++// dnsQuery is the real func for sending type65 query for given domain to given DNS server.
++// return ECH config, TTL and error
++func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
++	m := new(dns.Msg)
++	var dnsResolve []byte
++	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
++	// for DOH server
++	if strings.HasPrefix(server, "https://") || strings.HasPrefix(server, "h2c://") {
++		h2c := strings.HasPrefix(server, "h2c://")
++		m.SetEdns0(4096, false) // 4096 is the buffer size, false means no DNSSEC
++		padding := &dns.EDNS0_PADDING{Padding: make([]byte, int(crypto.RandBetween(100, 300)))}
++		if opt := m.IsEdns0(); opt != nil {
++			opt.Option = append(opt.Option, padding)
++		}
++		// always 0 in DOH
++		m.Id = 0
++		msg, err := m.Pack()
++		if err != nil {
++			return nil, 0, err
++		}
++		var client *http.Client
++		serverKey := ECHCacheKey(server, "", sockopt)
++		if client, _ = clientForECHDOH.Load(serverKey); client == nil {
++			// All traffic sent by core should via xray's internet.DialSystem
++			// This involves the behavior of some Android VPN GUI clients
++			tr := &http2.Transport{
++				IdleConnTimeout: net.ConnIdleTimeout,
++				ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
++				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
++					host, _, err := net.SplitHostPort(addr)
++					if err != nil {
++						return nil, err
++					}
++					dest, err := net.ParseDestination(network + ":" + addr)
++					if err != nil {
++						return nil, err
++					}
++					dnsCtx := ctx
++					if h2c {
++						dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false) // for insurance
++						dnsCtx = session.ContextWithMitmServerName(dnsCtx, host)
++					}
++					var conn net.Conn
++					conn, err = internet.DialSystem(dnsCtx, dest, sockopt)
++					if err != nil {
++						return nil, err
++					}
++
++					if !h2c {
++						conn = utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
++						if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
++							return nil, err
++						}
++					}
++					return conn, nil
++				},
++			}
++			c := &http.Client{
++				Timeout:   30 * time.Second,
++				Transport: tr,
++			}
++			client, _ = clientForECHDOH.LoadOrStore(serverKey, c)
++		}
++		req, err := http.NewRequest("POST", server, bytes.NewReader(msg))
++		if err != nil {
++			return nil, 0, err
++		}
++		// h2c: in config is just for claim
++		// change scheme to https and expect outbound to handle TLS (freedom + tlsSetting)
++		req.URL.Scheme = "https"
++		req.Header.Set("Accept", "application/dns-message")
++		req.Header.Set("Content-Type", "application/dns-message")
++		utils.TryDefaultHeadersWith(req.Header, "fetch")
++		req.Header.Set("X-Padding", utils.H2Base62Pad(crypto.RandBetween(100, 1000)))
++
++		resp, err := client.Do(req)
++		if err != nil {
++			return nil, 0, err
++		}
++		defer resp.Body.Close()
++		respBody, err := io.ReadAll(resp.Body)
++		if err != nil {
++			return nil, 0, err
++		}
++		if resp.StatusCode != http.StatusOK {
++			return nil, 0, errors.New("query failed with response code:", resp.StatusCode)
++		}
++		dnsResolve = respBody
++	} else if strings.HasPrefix(server, "udp://") { // for classic udp dns server
++		udpServerURL, err := url.Parse(server)
++		if err != nil {
++			return nil, 0, errors.New("failed to parse udp dns server ", server, " for ECH: ", err)
++		}
++		// default port 53 if not specified
++		if udpServerURL.Port() == "" {
++			udpServerURL.Host = udpServerURL.Host + ":53"
++		}
++		dest, err := net.ParseDestination("udp" + ":" + udpServerURL.Host)
++		if err != nil {
++			return nil, 0, errors.New("failed to parse udp dns server ", udpServerURL.Host, " for ECH: ", err)
++		}
++		dnsTimeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		// use xray's internet.DialSystem as mentioned above
++		conn, err := internet.DialSystem(dnsTimeoutCtx, dest, sockopt)
++		if err != nil {
++			return nil, 0, err
++		}
++		defer func() {
++			err := conn.Close()
++			if err != nil {
++				errors.LogDebug(context.Background(), "Failed to close connection: ", err)
++			}
++		}()
++		msg, err := m.Pack()
++		if err != nil {
++			return nil, 0, err
++		}
++		conn.Write(msg)
++		udpResponse := make([]byte, 512)
++		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++		_, err = conn.Read(udpResponse)
++		if err != nil {
++			return nil, 0, err
++		}
++		dnsResolve = udpResponse
++	}
++	respMsg := new(dns.Msg)
++	err := respMsg.Unpack(dnsResolve)
++	if err != nil {
++		return nil, 0, errors.New("failed to unpack dns response for ECH: ", err)
++	}
++	if len(respMsg.Answer) > 0 {
++		for _, answer := range respMsg.Answer {
++			if https, ok := answer.(*dns.HTTPS); ok && https.Hdr.Name == dns.Fqdn(domain) {
++				for _, v := range https.Value {
++					if echConfig, ok := v.(*dns.SVCBECHConfig); ok {
++						errors.LogDebug(context.Background(), "Get ECH config:", echConfig.String(), " TTL:", respMsg.Answer[0].Header().Ttl)
++						return echConfig.ECH, answer.Header().Ttl, nil
++					}
++				}
++			}
++		}
++	}
++	return nil, 0, errors.New("no valid ECH config found in DNS response")
++}
+--- /dev/null
++++ b/transport/internet/tls/ech_dns_off.go
+@@ -0,0 +1,16 @@
++//go:build !xray_ech_dns
++
++package tls
++
++import (
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/transport/internet"
++)
++
++// Rantau: ECH configs looked up over DNS ("echConfigList" naming a DNS server) are left out unless built
++// with -tags xray_ech_dns (ech_dns.go), so the engine does not link a DNS library. The lookup fails, and
++// ApplyECH then gives the connection an invalid ECH config, as it does when a lookup fails: the
++// connection fails instead of going without ECH. A config given in base64 works as before.
++func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
++	return nil, 0, errors.New("ECH configs over DNS are not built into this copy of Xray (build with -tags xray_ech_dns)")
++}
+--- /dev/null
++++ b/transport/internet/tls/ech_dns_test.go
+@@ -0,0 +1,58 @@
++//go:build xray_ech_dns
++
++package tls
++
++import (
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/xtls/xray-core/common"
++)
++
++// Rantau: moved from ech_test.go unchanged; it needs the lookup that only -tags xray_ech_dns builds in.
++
++func TestECHDial(t *testing.T) {
++	config := &Config{
++		ServerName:    "cloudflare.com",
++		EchConfigList: "encryptedsni.com+udp://1.1.1.1",
++	}
++	// test concurrent Dial(to test cache problem)
++	wg := sync.WaitGroup{}
++	for range 10 {
++		wg.Go(func() {
++			TLSConfig := config.GetTLSConfig()
++			TLSConfig.NextProtos = []string{"http/1.1"}
++			client := &http.Client{
++				Transport: &http.Transport{
++					TLSClientConfig: TLSConfig,
++				},
++			}
++			resp, err := client.Get("https://cloudflare.com/cdn-cgi/trace")
++			common.Must(err)
++			defer resp.Body.Close()
++			body, err := io.ReadAll(resp.Body)
++			common.Must(err)
++			if !strings.Contains(string(body), "sni=encrypted") {
++				t.Error("ECH Dial success but SNI is not encrypted")
++			}
++		})
++	}
++	wg.Wait()
++	// check cache
++	echConfigCache, ok := GlobalECHConfigCache.Load(ECHCacheKey("udp://1.1.1.1", "encryptedsni.com", nil))
++	if !ok {
++		t.Error("ECH config cache not found")
++	}
++	ok = echConfigCache.UpdateLock.TryLock()
++	if !ok {
++		t.Error("ECH config cache dead lock detected")
++	}
++	echConfigCache.UpdateLock.Unlock()
++	configRecord := echConfigCache.configRecord.Load()
++	if configRecord == nil {
++		t.Error("ECH config record not found in cache")
++	}
++}
+--- a/transport/internet/tls/ech_test.go
++++ b/transport/internet/tls/ech_test.go
+@@ -1,59 +1,10 @@
+ package tls
+ 
+ import (
+-	"io"
+-	"net/http"
+ 	"slices"
+-	"strings"
+-	"sync"
+ 	"testing"
+-
+-	"github.com/xtls/xray-core/common"
+ )
+ 
+-func TestECHDial(t *testing.T) {
+-	config := &Config{
+-		ServerName:    "cloudflare.com",
+-		EchConfigList: "encryptedsni.com+udp://1.1.1.1",
+-	}
+-	// test concurrent Dial(to test cache problem)
+-	wg := sync.WaitGroup{}
+-	for range 10 {
+-		wg.Go(func() {
+-			TLSConfig := config.GetTLSConfig()
+-			TLSConfig.NextProtos = []string{"http/1.1"}
+-			client := &http.Client{
+-				Transport: &http.Transport{
+-					TLSClientConfig: TLSConfig,
+-				},
+-			}
+-			resp, err := client.Get("https://cloudflare.com/cdn-cgi/trace")
+-			common.Must(err)
+-			defer resp.Body.Close()
+-			body, err := io.ReadAll(resp.Body)
+-			common.Must(err)
+-			if !strings.Contains(string(body), "sni=encrypted") {
+-				t.Error("ECH Dial success but SNI is not encrypted")
+-			}
+-		})
+-	}
+-	wg.Wait()
+-	// check cache
+-	echConfigCache, ok := GlobalECHConfigCache.Load(ECHCacheKey("udp://1.1.1.1", "encryptedsni.com", nil))
+-	if !ok {
+-		t.Error("ECH config cache not found")
+-	}
+-	ok = echConfigCache.UpdateLock.TryLock()
+-	if !ok {
+-		t.Error("ECH config cache dead lock detected")
+-	}
+-	echConfigCache.UpdateLock.Unlock()
+-	configRecord := echConfigCache.configRecord.Load()
+-	if configRecord == nil {
+-		t.Error("ECH config record not found in cache")
+-	}
+-}
+-
+ func TestECHDialFail(t *testing.T) {
+ 	config := &Config{
+ 		ServerName:    "cloudflare.com",

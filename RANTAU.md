@@ -2,9 +2,11 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.9` supplies the
-exact source built into the Rantau VPN apps from their releases after Android 0.1.83, macOS 0.2.70 and
-Windows 1.0.77, until a newer tag. It differs from `.8` only in the kept interface answer described below.
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.10` supplies the
+exact source built into the Rantau VPN apps whose licence notices name it (releases from 13 November 2026),
+until a newer tag. It differs from `.9` only in the parts left out unless asked for, described below.
+`v26.10.31-rantau.9` supplies the releases after Android 0.1.83, macOS 0.2.70 and Windows 1.0.77 that name
+it, up to the first ones naming `.10`. It differs from `.8` only in the kept interface answer described below.
 `v26.10.31-rantau.8` (the site names option described below) was built into no release.
 `v26.10.31-rantau.7` supplies the releases after Android 0.1.81, macOS 0.2.69 and Windows 1.0.76, up to and
 including Android 0.1.83, macOS 0.2.70 and Windows 1.0.77. It differs from `.6` in the raced lookups and the
@@ -30,6 +32,17 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **Left out unless asked for** (build tags). Parts Rantau never configures are built only with a tag, so
+  the apps carry less code; a configuration that asks for one of them fails with an error instead of
+  running without it. Lua scripts (the `script` of `app/dns`, `app/router` and the `noise` mask, and the Lua
+  modules of `common/log` and `common/geodata`): `-tags xray_lua`, with `script_off.go` standing in. DNS over
+  QUIC (`quic+local://` servers of `app/dns`): `-tags xray_doq`, with `nameserver_quic_off.go` standing in;
+  `app/proxyman/inbound` now hands a Hysteria inbound its listen context through an interface
+  (`ListenContext`, implemented by `proxy/hysteria`) instead of importing Hysteria, which changes nothing
+  where Hysteria is built in. ECH configs looked up over DNS (`dnsQuery` of `transport/internet/tls`, moved
+  unchanged to `ech_dns.go`): `-tags xray_ech_dns`, with `ech_dns_off.go` failing the lookup as any failed
+  lookup does; a base64 `echConfigList` works as before. `common.GetGOBIN` and `GetGOPATH`, which nothing
+  calls, are removed, and with them `go/build`.
 - **The interface answer is kept** (`transport/internet/interface_cache.go`). A dial bound to a network interface
   looked the interface up by name every time; on Windows that lists every adapter of the computer and took tens to
   hundreds of milliseconds per connection. The answer is now kept: used as it is for 10 s, then used at once while

@@ -18,9 +18,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
-	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/udp"
@@ -131,11 +129,18 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 	return w.proxy
 }
 
+// listenContexter is an inbound whose listener needs something from it in its context (Hysteria: the
+// validator of its users). Rantau: an interface instead of Hysteria's type, so this package does not link
+// Hysteria and QUIC into every program that has inbounds.
+type listenContexter interface {
+	ListenContext(ctx context.Context) context.Context
+}
+
 func (w *tcpWorker) Start() error {
 	ctx := context.Background()
 
-	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
-		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
+	if v, ok := w.proxy.(listenContexter); ok {
+		ctx = v.ListenContext(ctx)
 	}
 
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
