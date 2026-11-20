@@ -144,14 +144,19 @@ func (p *preconnectPool) pop(demand bool) (spare *preconnectSpare, ok bool) {
 	return spare, true
 }
 
+// refillLocked starts dials up to the limit. The spares started together share one lifetime,
+// drawn at random as before, so they close within the same moment: on a phone that is one
+// radio wake for both closes instead of two (2026-11-20 battery pass). The lifetime still
+// differs from one refill to the next.
 func (p *preconnectPool) refillLocked(now time.Time) {
-	if now.Before(p.nextTry) {
+	if now.Before(p.nextTry) || len(p.ready)+p.inFlight >= p.limit {
 		return
 	}
+	life := p.lifetime()
 	for len(p.ready)+p.inFlight < p.limit {
 		p.inFlight++
 		p.wg.Add(1)
-		go p.fill()
+		go p.fill(life)
 	}
 }
 
@@ -173,7 +178,7 @@ func preconnectAlive(conn stat.Connection, wait time.Duration) bool {
 	return conn.SetReadDeadline(time.Time{}) == nil
 }
 
-func (p *preconnectPool) fill() {
+func (p *preconnectPool) fill(life time.Duration) {
 	defer p.wg.Done()
 	ctx, cancel := context.WithTimeout(p.ctx, p.dialTimeout)
 	preconnectDials.Add(1)
@@ -196,7 +201,6 @@ func (p *preconnectPool) fill() {
 	}
 	p.failures = 0
 	p.nextTry = time.Time{}
-	life := p.lifetime()
 	spare := &preconnectSpare{conn: conn, expires: time.Now().Add(life)}
 	p.ready = append(p.ready, spare)
 	spare.timer = time.AfterFunc(life, func() { p.expire(spare) })

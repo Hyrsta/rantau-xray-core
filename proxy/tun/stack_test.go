@@ -1013,6 +1013,61 @@ func TestTCPWindow(t *testing.T) {
 	p.silent(tcpTick + tcpTick/2)
 }
 
+// A window that stays closed is probed after tcpProbeFirst, then twice as seldom (a persist timer), instead of the
+// stack ticking ten times a second while it waits; what the peer sends meanwhile is still acknowledged after a tick,
+// not when the next probe is due.
+func TestTCPWindowProbesBackOff(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	newTestStack(t, l, accept(conns))
+	p.connect(nil)
+	a := take(t, conns)
+
+	// closed with a keepalive, as in TestTCPWindow
+	p.window = 0
+	p.send(p.seq-1, tcpAck, nil, nil)
+	p.receive()
+	done := make(chan struct{})
+	go func() {
+		if err := a.conn.(buf.Writer).WriteMultiBuffer(buf.MergeBytes(nil, []byte("abc"))); err != nil {
+			t.Error(err)
+		}
+		close(done)
+	}()
+	start := time.Now()
+	probe := func() time.Duration {
+		t.Helper()
+		s := p.receive()
+		if s.flags != tcpAck || s.seq != p.ack-1 || len(s.payload) != 0 {
+			t.Fatal("not a probe: flags ", s.flags, ", seq ", s.seq, ", payload ", s.payload)
+		}
+		return time.Since(start)
+	}
+	first := probe()
+	if first < tcpProbeFirst-tcpTick/2 || first > tcpProbeFirst+3*tcpTick {
+		t.Fatal("the first probe came after ", first)
+	}
+	// answered with the window still closed, then something comes from the peer
+	p.send(p.seq, tcpAck, nil, nil)
+	p.send(p.seq, tcpAck|tcpPsh, nil, []byte("x"))
+	p.seq++
+	if s := p.receive(); s.flags != tcpAck || s.ack != p.seq || len(s.payload) != 0 {
+		t.Fatal("not an acknowledgment: flags ", s.flags, ", ack ", s.ack, ", payload ", s.payload)
+	}
+	if after := time.Since(start) - first; after > 3*tcpTick {
+		t.Fatal("what the peer sent was acknowledged ", after, " after the probe")
+	}
+	if second := probe() - first; second < 2*tcpProbeFirst-tcpTick || second > 2*tcpProbeFirst+3*tcpTick {
+		t.Fatal("the second probe came ", second, " after the first")
+	}
+	p.window = 250
+	p.send(p.seq, tcpAck, nil, nil)
+	if s := p.receive(); s.seq != p.ack || string(s.payload) != "abc" {
+		t.Fatal("seq ", s.seq, " with ", s.payload)
+	}
+	<-done
+}
+
 // A keepalive is answered, and not before a segment that was made before it is written.
 func TestTCPKeepalive(t *testing.T) {
 	conns := make(chan accepted, 1)

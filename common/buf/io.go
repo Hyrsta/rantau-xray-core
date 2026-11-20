@@ -60,11 +60,10 @@ func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (M
 			close(r.done)
 		}()
 	}
-	timeout := make(chan struct{})
-	go func() {
-		time.Sleep(duration)
-		close(timeout)
-	}()
+	// A timer that is stopped when the read comes first, not a goroutine that sleeps out the whole wait and
+	// wakes for nothing on every new connection (Rantau, 2026-11-20 battery pass).
+	timeout := time.NewTimer(duration)
+	defer timeout.Stop()
 	select {
 	case <-r.done:
 		r.done = nil
@@ -72,7 +71,7 @@ func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (M
 			r.Counter.Add(int64(r.mb.Len()))
 		}
 		return r.mb, r.err
-	case <-timeout:
+	case <-timeout.C:
 		return nil, nil
 	}
 }

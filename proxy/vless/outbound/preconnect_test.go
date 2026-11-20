@@ -294,6 +294,34 @@ func TestPreconnectLifetimeSpreadsInsidePolicy(t *testing.T) {
 	}
 }
 
+// Both spares of one refill close together (one radio wake on a phone), while the lifetime
+// still differs between refills and stays inside the policy.
+func TestPreconnectSparesOfOneRefillShareTheirLifetime(t *testing.T) {
+	lives := map[time.Duration]bool{}
+	for round := 0; round < 8; round++ {
+		p := newPreconnectPool(2, func(context.Context) (stat.Connection, error) { return &trackedConn{}, nil })
+		p.policy = preconnectPolicy{ttlMin: 20 * time.Second, ttlMax: 40 * time.Second}
+		started := time.Now()
+		p.Take()
+		eventually(t, func() bool { return readyCount(p) == 2 })
+		p.mu.Lock()
+		a, b := p.ready[0].expires, p.ready[1].expires
+		p.mu.Unlock()
+		if gap := a.Sub(b).Abs(); gap > 100*time.Millisecond {
+			t.Fatalf("spares of one refill close %v apart", gap)
+		}
+		life := a.Sub(started)
+		if life < 20*time.Second || life > 40*time.Second+time.Second {
+			t.Fatalf("lifetime %v outside 20-40 s", life)
+		}
+		lives[life.Round(100*time.Millisecond)] = true
+		p.Close()
+	}
+	if len(lives) < 2 {
+		t.Fatal("every refill drew the same lifetime")
+	}
+}
+
 func TestPreconnectStaleSparesFallBackInsteadOfFailing(t *testing.T) {
 	p := newPreconnectPool(2, func(ctx context.Context) (stat.Connection, error) { <-ctx.Done(); return nil, ctx.Err() })
 	defer p.Close()

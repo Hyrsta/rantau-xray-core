@@ -2,9 +2,11 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.10` supplies the
-exact source built into the Rantau VPN apps whose licence notices name it (releases from 13 November 2026),
-until a newer tag. It differs from `.9` only in the parts left out unless asked for, described below.
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.11` supplies the
+exact source built into the Rantau VPN apps whose licence notices name it (Android, macOS and Windows 2.2.18
+and later), until a newer tag. It differs from `.10` only in the fewer wake-ups described below.
+`v26.10.31-rantau.10` supplies the releases from 13 November 2026 that name it, up to the first ones naming
+`.11`. It differs from `.9` only in the parts left out unless asked for, described below.
 `v26.10.31-rantau.9` supplies the releases after Android 0.1.83, macOS 0.2.70 and Windows 1.0.77 that name
 it, up to the first ones naming `.10`. It differs from `.8` only in the kept interface answer described below.
 `v26.10.31-rantau.8` (the site names option described below) was built into no release.
@@ -32,6 +34,12 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 [sing](https://github.com/SagerNet/sing) library, so Shadowsocks 2022 and the rest of the original are
 included as they are.
 
+- **Fewer wake-ups** (same work, less waking while a tunnel is up). The two reserve connections of one
+  refill share one random lifetime, so they close together (`proxy/vless/outbound/preconnect.go`). A TCP
+  window the system keeps closed is probed after one second, then twice as seldom up to every eight seconds,
+  instead of ten times a second, and a connection whose data all arrived stops its timer
+  (`proxy/tun/tcp_lightweight.go`). `ReadMultiBufferTimeout` (`common/buf/io.go`) waits on a timer that is
+  stopped when the data comes first, instead of a goroutine that sleeps out the whole wait.
 - **Left out unless asked for** (build tags). Parts Rantau never configures are built only with a tag, so
   the apps carry less code; a configuration that asks for one of them fails with an error instead of
   running without it. Lua scripts (the `script` of `app/dns`, `app/router` and the `noise` mask, and the Lua

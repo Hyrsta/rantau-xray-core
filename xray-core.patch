@@ -980,6 +980,33 @@
  package router
  
  import (
+--- a/common/buf/io.go
++++ b/common/buf/io.go
+@@ -60,11 +60,10 @@
+ 			close(r.done)
+ 		}()
+ 	}
+-	timeout := make(chan struct{})
+-	go func() {
+-		time.Sleep(duration)
+-		close(timeout)
+-	}()
++	// A timer that is stopped when the read comes first, not a goroutine that sleeps out the whole wait and
++	// wakes for nothing on every new connection (Rantau, 2026-11-20 battery pass).
++	timeout := time.NewTimer(duration)
++	defer timeout.Stop()
+ 	select {
+ 	case <-r.done:
+ 		r.done = nil
+@@ -72,7 +71,7 @@
+ 			r.Counter.Add(int64(r.mb.Len()))
+ 		}
+ 		return r.mb, r.err
+-	case <-timeout:
++	case <-timeout.C:
+ 		return nil, nil
+ 	}
+ }
 --- a/common/common.go
 +++ b/common/common.go
 @@ -4,7 +4,6 @@
@@ -1941,6 +1968,160 @@
 +		t.Fatal("activation of an ordinary instance started its stack again")
 +	}
 +}
+--- a/proxy/tun/stack_test.go
++++ b/proxy/tun/stack_test.go
+@@ -1013,6 +1013,61 @@
+ 	p.silent(tcpTick + tcpTick/2)
+ }
+ 
++// A window that stays closed is probed after tcpProbeFirst, then twice as seldom (a persist timer), instead of the
++// stack ticking ten times a second while it waits; what the peer sends meanwhile is still acknowledged after a tick,
++// not when the next probe is due.
++func TestTCPWindowProbesBackOff(t *testing.T) {
++	conns := make(chan accepted, 1)
++	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
++	newTestStack(t, l, accept(conns))
++	p.connect(nil)
++	a := take(t, conns)
++
++	// closed with a keepalive, as in TestTCPWindow
++	p.window = 0
++	p.send(p.seq-1, tcpAck, nil, nil)
++	p.receive()
++	done := make(chan struct{})
++	go func() {
++		if err := a.conn.(buf.Writer).WriteMultiBuffer(buf.MergeBytes(nil, []byte("abc"))); err != nil {
++			t.Error(err)
++		}
++		close(done)
++	}()
++	start := time.Now()
++	probe := func() time.Duration {
++		t.Helper()
++		s := p.receive()
++		if s.flags != tcpAck || s.seq != p.ack-1 || len(s.payload) != 0 {
++			t.Fatal("not a probe: flags ", s.flags, ", seq ", s.seq, ", payload ", s.payload)
++		}
++		return time.Since(start)
++	}
++	first := probe()
++	if first < tcpProbeFirst-tcpTick/2 || first > tcpProbeFirst+3*tcpTick {
++		t.Fatal("the first probe came after ", first)
++	}
++	// answered with the window still closed, then something comes from the peer
++	p.send(p.seq, tcpAck, nil, nil)
++	p.send(p.seq, tcpAck|tcpPsh, nil, []byte("x"))
++	p.seq++
++	if s := p.receive(); s.flags != tcpAck || s.ack != p.seq || len(s.payload) != 0 {
++		t.Fatal("not an acknowledgment: flags ", s.flags, ", ack ", s.ack, ", payload ", s.payload)
++	}
++	if after := time.Since(start) - first; after > 3*tcpTick {
++		t.Fatal("what the peer sent was acknowledged ", after, " after the probe")
++	}
++	if second := probe() - first; second < 2*tcpProbeFirst-tcpTick || second > 2*tcpProbeFirst+3*tcpTick {
++		t.Fatal("the second probe came ", second, " after the first")
++	}
++	p.window = 250
++	p.send(p.seq, tcpAck, nil, nil)
++	if s := p.receive(); s.seq != p.ack || string(s.payload) != "abc" {
++		t.Fatal("seq ", s.seq, " with ", s.payload)
++	}
++	<-done
++}
++
+ // A keepalive is answered, and not before a segment that was made before it is written.
+ func TestTCPKeepalive(t *testing.T) {
+ 	conns := make(chan accepted, 1)
+--- a/proxy/tun/tcp_lightweight.go
++++ b/proxy/tun/tcp_lightweight.go
+@@ -68,8 +68,11 @@
+ 	// is not counted), and one that never answered after it was sent again that many times, after twenty seconds
+ 	tcpGiveUpTicks    = 4 * tcpMinuteTicks
+ 	tcpSynRetransmits = 5
+-	// ticks between the probes of a window that stays closed
+-	tcpProbeTicks = 10
++	// a window that stays closed is probed after tcpProbeFirst, then twice as seldom, every tcpProbeMost at most
++	// (a persist timer): the system opens it by itself as soon as its app reads, so a probe only matters when
++	// that segment was lost, and a tab that is paused for an hour does not wake the engine ten times a second
++	tcpProbeFirst = time.Second
++	tcpProbeMost  = 8 * time.Second
+ 	// tcpLinger is how long a closed connection waits for the system to close its side
+ 	tcpLinger = 30 * time.Second
+ )
+@@ -206,6 +209,11 @@
+ 
+ 	timer *time.Timer
+ 	armed bool
++	// probing is set while the timer waits only for the next probe of a closed window, at probeAt: anything
++	// that needs a tick sooner takes the timer back. probeWait is how long the last probe waited
++	probing   bool
++	probeAt   time.Time
++	probeWait time.Duration
+ 	// stalled counts ticks without an acknowledgment of what waits for one
+ 	stalled, retransmitTicks, retransmits int
+ 	// lostTicks counts the ticks since the timer sent again the first time since something was acknowledged
+@@ -623,6 +631,11 @@
+ 	if c.blocked && (c.sndUna == c.sndNxt || c.space() >= enough) {
+ 		c.writable.Broadcast()
+ 	}
++	if acked != 0 && c.armed && !c.probing && c.sndUna == c.sndNxt && c.rcvAcked == c.rcvNxt && !c.blocked && !c.closed {
++		// all of it arrived and nothing waits for a tick: the one armed when it was sent would only wake for nothing
++		c.timer.Stop()
++		c.armed = false
++	}
+ }
+ 
+ // clocked takes the time since timedAt as how long an acknowledgment takes. The next ones are waited for as long
+@@ -955,12 +968,13 @@
+ 	}
+ }
+ 
+-// arm makes tick run after d, unless it is going to run already. c.mu is held
++// arm makes tick run after d, unless it is going to run already: sooner, when it only waits for a probe of a
++// closed window. c.mu is held
+ func (c *tcpConn) arm(d time.Duration) {
+-	if c.armed {
++	if c.armed && !c.probing {
+ 		return
+ 	}
+-	c.armed = true
++	c.armed, c.probing = true, false
+ 	if c.timer == nil {
+ 		c.timer = time.AfterFunc(d, c.tick)
+ 	} else {
+@@ -1015,11 +1029,19 @@
+ 		}
+ 		c.arm(tcpTick)
+ 	case c.blocked:
+-		// the segment that opens the window may have been lost, this one is answered with the window
+-		if c.stalled++; c.stalled%tcpProbeTicks == 0 {
++		// the segment that opens the window may have been lost, a probe is answered with the window
++		now := time.Now()
++		switch {
++		case c.probeWait == 0:
++			c.probeWait = tcpProbeFirst
++			c.probeAt = now.Add(c.probeWait)
++		case !now.Before(c.probeAt):
+ 			c.send(c.sndUna-1, tcpAck, nil, nil)
++			c.probeWait = min(2*c.probeWait, tcpProbeMost)
++			c.probeAt = now.Add(c.probeWait)
+ 		}
+-		c.arm(tcpTick)
++		c.arm(c.probeAt.Sub(now))
++		c.probing = true
+ 	case c.closed:
+ 		if c.lingered {
+ 			c.reset()
+@@ -1155,6 +1177,9 @@
+ 		if c.err != nil {
+ 			break
+ 		}
++		// the window is open: a next one that closes is probed after tcpProbeFirst again. An acknowledgment that
++		// leaves it closed wakes the writer too, and keeps the wait between probes as it was
++		c.probeWait = 0
+ 		// the mss may have become smaller while the last segment was written
+ 		most := min(c.mss, int(c.space()))
+ 		if c.stack.segmenter != nil {
 --- a/proxy/tun/tun_android.go
 +++ b/proxy/tun/tun_android.go
 @@ -27,7 +27,7 @@
@@ -2740,7 +2921,7 @@
  }
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect.go
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,296 @@
 +package outbound
 +
 +import (
@@ -2887,14 +3068,19 @@
 +	return spare, true
 +}
 +
++// refillLocked starts dials up to the limit. The spares started together share one lifetime,
++// drawn at random as before, so they close within the same moment: on a phone that is one
++// radio wake for both closes instead of two (2026-11-20 battery pass). The lifetime still
++// differs from one refill to the next.
 +func (p *preconnectPool) refillLocked(now time.Time) {
-+	if now.Before(p.nextTry) {
++	if now.Before(p.nextTry) || len(p.ready)+p.inFlight >= p.limit {
 +		return
 +	}
++	life := p.lifetime()
 +	for len(p.ready)+p.inFlight < p.limit {
 +		p.inFlight++
 +		p.wg.Add(1)
-+		go p.fill()
++		go p.fill(life)
 +	}
 +}
 +
@@ -2916,7 +3102,7 @@
 +	return conn.SetReadDeadline(time.Time{}) == nil
 +}
 +
-+func (p *preconnectPool) fill() {
++func (p *preconnectPool) fill(life time.Duration) {
 +	defer p.wg.Done()
 +	ctx, cancel := context.WithTimeout(p.ctx, p.dialTimeout)
 +	preconnectDials.Add(1)
@@ -2939,7 +3125,6 @@
 +	}
 +	p.failures = 0
 +	p.nextTry = time.Time{}
-+	life := p.lifetime()
 +	spare := &preconnectSpare{conn: conn, expires: time.Now().Add(life)}
 +	p.ready = append(p.ready, spare)
 +	spare.timer = time.AfterFunc(life, func() { p.expire(spare) })
@@ -3060,7 +3245,7 @@
 +}
 --- /dev/null
 +++ b/proxy/vless/outbound/preconnect_test.go
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,443 @@
 +package outbound
 +
 +import (
@@ -3354,6 +3539,34 @@
 +	}
 +	if lo > 22*time.Second || hi < 38*time.Second {
 +		t.Fatalf("lifetimes not spread over the range: %v-%v", lo, hi)
++	}
++}
++
++// Both spares of one refill close together (one radio wake on a phone), while the lifetime
++// still differs between refills and stays inside the policy.
++func TestPreconnectSparesOfOneRefillShareTheirLifetime(t *testing.T) {
++	lives := map[time.Duration]bool{}
++	for round := 0; round < 8; round++ {
++		p := newPreconnectPool(2, func(context.Context) (stat.Connection, error) { return &trackedConn{}, nil })
++		p.policy = preconnectPolicy{ttlMin: 20 * time.Second, ttlMax: 40 * time.Second}
++		started := time.Now()
++		p.Take()
++		eventually(t, func() bool { return readyCount(p) == 2 })
++		p.mu.Lock()
++		a, b := p.ready[0].expires, p.ready[1].expires
++		p.mu.Unlock()
++		if gap := a.Sub(b).Abs(); gap > 100*time.Millisecond {
++			t.Fatalf("spares of one refill close %v apart", gap)
++		}
++		life := a.Sub(started)
++		if life < 20*time.Second || life > 40*time.Second+time.Second {
++			t.Fatalf("lifetime %v outside 20-40 s", life)
++		}
++		lives[life.Round(100*time.Millisecond)] = true
++		p.Close()
++	}
++	if len(lives) < 2 {
++		t.Fatal("every refill drew the same lifetime")
 +	}
 +}
 +

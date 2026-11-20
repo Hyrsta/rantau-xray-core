@@ -68,8 +68,11 @@ const (
 	// is not counted), and one that never answered after it was sent again that many times, after twenty seconds
 	tcpGiveUpTicks    = 4 * tcpMinuteTicks
 	tcpSynRetransmits = 5
-	// ticks between the probes of a window that stays closed
-	tcpProbeTicks = 10
+	// a window that stays closed is probed after tcpProbeFirst, then twice as seldom, every tcpProbeMost at most
+	// (a persist timer): the system opens it by itself as soon as its app reads, so a probe only matters when
+	// that segment was lost, and a tab that is paused for an hour does not wake the engine ten times a second
+	tcpProbeFirst = time.Second
+	tcpProbeMost  = 8 * time.Second
 	// tcpLinger is how long a closed connection waits for the system to close its side
 	tcpLinger = 30 * time.Second
 )
@@ -206,6 +209,11 @@ type tcpConn struct {
 
 	timer *time.Timer
 	armed bool
+	// probing is set while the timer waits only for the next probe of a closed window, at probeAt: anything
+	// that needs a tick sooner takes the timer back. probeWait is how long the last probe waited
+	probing   bool
+	probeAt   time.Time
+	probeWait time.Duration
 	// stalled counts ticks without an acknowledgment of what waits for one
 	stalled, retransmitTicks, retransmits int
 	// lostTicks counts the ticks since the timer sent again the first time since something was acknowledged
@@ -623,6 +631,11 @@ func (c *tcpConn) acknowledge(s segment) {
 	if c.blocked && (c.sndUna == c.sndNxt || c.space() >= enough) {
 		c.writable.Broadcast()
 	}
+	if acked != 0 && c.armed && !c.probing && c.sndUna == c.sndNxt && c.rcvAcked == c.rcvNxt && !c.blocked && !c.closed {
+		// all of it arrived and nothing waits for a tick: the one armed when it was sent would only wake for nothing
+		c.timer.Stop()
+		c.armed = false
+	}
 }
 
 // clocked takes the time since timedAt as how long an acknowledgment takes. The next ones are waited for as long
@@ -955,12 +968,13 @@ func (c *tcpConn) unreachable(seq uint32) {
 	}
 }
 
-// arm makes tick run after d, unless it is going to run already. c.mu is held
+// arm makes tick run after d, unless it is going to run already: sooner, when it only waits for a probe of a
+// closed window. c.mu is held
 func (c *tcpConn) arm(d time.Duration) {
-	if c.armed {
+	if c.armed && !c.probing {
 		return
 	}
-	c.armed = true
+	c.armed, c.probing = true, false
 	if c.timer == nil {
 		c.timer = time.AfterFunc(d, c.tick)
 	} else {
@@ -1015,11 +1029,19 @@ func (c *tcpConn) tick() {
 		}
 		c.arm(tcpTick)
 	case c.blocked:
-		// the segment that opens the window may have been lost, this one is answered with the window
-		if c.stalled++; c.stalled%tcpProbeTicks == 0 {
+		// the segment that opens the window may have been lost, a probe is answered with the window
+		now := time.Now()
+		switch {
+		case c.probeWait == 0:
+			c.probeWait = tcpProbeFirst
+			c.probeAt = now.Add(c.probeWait)
+		case !now.Before(c.probeAt):
 			c.send(c.sndUna-1, tcpAck, nil, nil)
+			c.probeWait = min(2*c.probeWait, tcpProbeMost)
+			c.probeAt = now.Add(c.probeWait)
 		}
-		c.arm(tcpTick)
+		c.arm(c.probeAt.Sub(now))
+		c.probing = true
 	case c.closed:
 		if c.lingered {
 			c.reset()
@@ -1155,6 +1177,9 @@ func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if c.err != nil {
 			break
 		}
+		// the window is open: a next one that closes is probed after tcpProbeFirst again. An acknowledgment that
+		// leaves it closed wakes the writer too, and keeps the wait between probes as it was
+		c.probeWait = 0
 		// the mss may have become smaller while the last segment was written
 		most := min(c.mss, int(c.space()))
 		if c.stack.segmenter != nil {
