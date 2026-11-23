@@ -1312,11 +1312,10 @@
  	"github.com/xtls/xray-core/features/policy"
  	"github.com/xtls/xray-core/features/stats"
  	"github.com/xtls/xray-core/proxy"
-@@ -61,6 +62,14 @@
- 			return h.Init(config.(*Config), pm)
+@@ -62,6 +63,14 @@
  		}); err != nil {
  			return nil, err
-+		}
+ 		}
 +		if home := mainlandSitesFrom(ctx); home != nil {
 +			if err := core.RequireFeatures(ctx, func(resolver dns.Client) error {
 +				h.home, h.homeResolver = home, resolver
@@ -1324,9 +1323,10 @@
 +			}); err != nil {
 +				return nil, err
 +			}
- 		}
++		}
  		return h, nil
  	}))
+ 
 @@ -98,6 +107,9 @@
  	finalRules      []*FinalRule
  	resolveStrategy internet.DomainStrategy
@@ -1337,23 +1337,51 @@
  }
  
  func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
-@@ -288,6 +300,8 @@
- 			UDPOverride.Port = destination.Port
+@@ -289,6 +301,14 @@
  		}
  	}
-+
-+	destination = homeTarget(ctx, h.home, h.homeResolver, ob, destination)
  
++	// appTarget is where the app sent a UDP flow that homeTarget moved: its datagrams for that address go
++	// to the home address, and the home address's replies are given back as from appTarget.
++	appTarget := destination
++	destination = homeTarget(ctx, h.home, h.homeResolver, ob, destination)
++	if destination.Network != net.Network_UDP || destination.Address == appTarget.Address {
++		appTarget = destination
++	}
++
  	input := link.Reader
  	output := link.Writer
+ 
+@@ -409,6 +429,9 @@
+ 			}
+ 		} else {
+ 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
++			if appTarget != destination {
++				writer = &homePacketWriter{Writer: writer, from: appTarget, to: destination}
++			}
+ 			if h.config.Noises != nil {
+ 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
+ 				writer = &NoisePacketWriter{
+@@ -443,7 +466,9 @@
+ 		if destination.Network == net.Network_TCP {
+ 			reader = buf.NewReader(conn)
+ 		} else {
+-			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
++			// Replies from the dialed address are given back as from appTarget (InitChangedAddr to
++			// InitUnchangedAddr), the address a re-pointed flow's app sent to.
++			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, appTarget)
+ 		}
+ 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+ 			return errors.New("failed to process response").Base(err)
 --- /dev/null
 +++ b/proxy/freedom/mainland_sites.go
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,98 @@
 +package freedom
 +
 +import (
 +	"context"
 +
++	"github.com/xtls/xray-core/common/buf"
 +	"github.com/xtls/xray-core/common/errors"
 +	"github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/common/session"
@@ -1364,15 +1392,17 @@
 +
 +// WithMainlandSites makes the freedom outbounds of an instance built with this context connect a site
 +// to its address at home when the app picked one abroad. The case: a TCP connection whose sniffed name
-+// (TLS or HTTP, read by routeOnly sniffing) was routed to freedom, to a public IPv4 address for which
-+// home is false. The instance's own resolver is asked for the name, and the first IPv4 address of its
-+// answer for which home is true replaces the app's address. The app gets the same site from a server
-+// nearby: a browser that looks names up over its own DNS over HTTPS through a proxy, for example, is
-+// given a Chinese site's overseas servers, and a direct connection to those from inside China crosses
-+// the border (the page took 4 to 8 s instead of 0.2 s, 2026-11-23).
++// (TLS or HTTP, read by routeOnly sniffing), or a UDP flow whose sniffed name is QUIC's (HTTP/3), was
++// routed to freedom, to a public IPv4 address for which home is false. The instance's own resolver is
++// asked for the name, and the first IPv4 address of its answer for which home is true replaces the app's
++// address. The app gets the same site from a server nearby: a browser that looks names up over its own
++// DNS over HTTPS through a proxy, for example, is given a Chinese site's overseas servers, and a direct
++// connection to those from inside China crosses the border (the page took 4 to 8 s instead of 0.2 s,
++// 2026-11-23; over HTTP/3 0.7 to 2.4 s instead of 0.02 to 0.4 s). A QUIC flow's replies from the home
++// address are given back as from the address the app sent to, so its connection stays the same to it.
 +//
-+// Everything else is dialed as before: UDP, IPv6, local and reserved addresses, addresses for which home
-+// is true, connections without a sniffed name, and names whose answer has no home address or fails.
++// Everything else is dialed as before: other UDP, IPv6, local and reserved addresses, addresses for which
++// home is true, connections without a sniffed name, and names whose answer has no home address or fails.
 +// Other users of this Xray copy keep normal behavior unless they opt in.
 +func WithMainlandSites(ctx context.Context, home func(net.IP) bool) context.Context {
 +	return context.WithValue(ctx, mainlandSitesKey{}, home)
@@ -1393,13 +1423,17 @@
 +		ip.IsUnspecified() || cgnat.Contains(ip) || ip[0] == 0 || ip[0] >= 240)
 +}
 +
-+// nameProtocols are the TCP sniffers whose name says which site the connection is for.
-+var nameProtocols = map[string]bool{"tls": true, "http1": true, "http2": true}
++// nameProtocols are the sniffers whose name says which site a connection is for: TLS and HTTP on TCP,
++// QUIC on UDP.
++var nameProtocols = map[net.Network]map[string]bool{
++	net.Network_TCP: {"tls": true, "http1": true, "http2": true},
++	net.Network_UDP: {"quic": true},
++}
 +
 +// homeTarget is the destination to dial: the target, or the same port at the name's home address (see
 +// WithMainlandSites).
 +func homeTarget(ctx context.Context, home func(net.IP) bool, resolver dns.Client, ob *session.Outbound, target net.Destination) net.Destination {
-+	if home == nil || resolver == nil || target.Network != net.Network_TCP || target.Address == nil || !target.Address.Family().IsIPv4() {
++	if home == nil || resolver == nil || nameProtocols[target.Network] == nil || target.Address == nil || !target.Address.Family().IsIPv4() {
 +		return target
 +	}
 +	if ip := target.Address.IP().To4(); ip == nil || !public(ip) || home(ip) {
@@ -1409,7 +1443,7 @@
 +	if name == nil || !name.Family().IsDomain() {
 +		return target
 +	}
-+	if content := session.ContentFromContext(ctx); content == nil || !nameProtocols[content.Protocol] {
++	if content := session.ContentFromContext(ctx); content == nil || !nameProtocols[target.Network][content.Protocol] {
 +		return target
 +	}
 +	ips, _, err := resolver.LookupIP(name.Domain(), dns.IPOption{IPv4Enable: true})
@@ -1419,21 +1453,40 @@
 +	for _, ip := range ips {
 +		if ip4 := ip.To4(); ip4 != nil && public(ip4) && home(ip4) {
 +			errors.LogInfo(ctx, "connecting ", name.Domain(), " at home ", ip4, " instead of ", target.Address)
-+			return net.Destination{Network: net.Network_TCP, Address: net.IPAddress(ip4), Port: target.Port}
++			return net.Destination{Network: target.Network, Address: net.IPAddress(ip4), Port: target.Port}
 +		}
 +	}
 +	return target
 +}
++
++// homePacketWriter sends a re-pointed UDP flow's datagrams for the app's address (from) to the home address
++// (to). The flow's datagrams carry their destination, and only that one address is moved.
++type homePacketWriter struct {
++	buf.Writer
++	from, to net.Destination
++}
++
++func (w *homePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	for _, b := range mb {
++		if b.UDP != nil && b.UDP.Address == w.from.Address && b.UDP.Port == w.from.Port {
++			b.UDP.Address = w.to.Address
++		}
++	}
++	return w.Writer.WriteMultiBuffer(mb)
++}
 --- /dev/null
 +++ b/proxy/freedom/mainland_sites_test.go
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,211 @@
 +package freedom
 +
 +import (
 +	"context"
 +	"errors"
++	gonet "net"
 +	"testing"
++	"time"
 +
++	"github.com/xtls/xray-core/common/buf"
 +	"github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/common/session"
 +	"github.com/xtls/xray-core/features/dns"
@@ -1470,12 +1523,16 @@
 +}
 +
 +func TestHomeTargetMovesASiteAbroadHome(t *testing.T) {
-+	for _, protocol := range []string{"tls", "http1", "http2"} {
++	for _, protocol := range []string{"tls", "http1", "http2", "quic"} {
 +		resolver := &fakeResolver{ips: []net.IP{net.ParseIP("43.175.44.34"), net.ParseIP("101.1.2.3"), net.ParseIP("101.1.2.4")}}
 +		target := net.TCPDestination(net.ParseAddress("43.175.44.34"), 443)
++		want := net.TCPDestination(net.ParseAddress("101.1.2.3"), 443)
++		if protocol == "quic" { // HTTP/3: a UDP flow
++			target = net.UDPDestination(net.ParseAddress("43.175.44.34"), 443)
++			want = net.UDPDestination(net.ParseAddress("101.1.2.3"), 443)
++		}
 +		ctx, ob := sniffed(protocol, "y.qq.com", target)
 +		got := homeTarget(ctx, testHome, resolver, ob, target)
-+		want := net.TCPDestination(net.ParseAddress("101.1.2.3"), 443)
 +		if got != want {
 +			t.Errorf("%s: got %v, want %v", protocol, got, want)
 +		}
@@ -1497,7 +1554,14 @@
 +		asks     bool
 +	}{
 +		{"already home", "tls", "y.qq.com", net.TCPDestination(net.ParseAddress("101.9.9.9"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
-+		{"UDP (QUIC)", "quic", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"UDP not QUIC", "bittorrent", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"UDP not sniffed", "", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"QUIC without a name", "quic", "", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"QUIC's name on TCP", "quic", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"TLS's name on UDP", "tls", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"QUIC to IPv6", "quic", "y.qq.com", net.UDPDestination(net.ParseAddress("2402:4e00::1"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"QUIC already home", "quic", "y.qq.com", net.UDPDestination(net.ParseAddress("101.9.9.9"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"QUIC, answer abroad too", "quic", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("43.175.44.35")}}, testHome, true},
 +		{"no sniffed name", "tls", "", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
 +		{"not sniffed", "", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
 +		{"other protocol", "bittorrent", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
@@ -1533,6 +1597,95 @@
 +	}
 +	if mainlandSitesFrom(WithMainlandSites(context.Background(), testHome)) == nil {
 +		t.Fatal("the opt-in was lost")
++	}
++}
++
++// recordingWriter keeps the datagrams' destinations.
++type recordingWriter struct{ sent []net.Destination }
++
++func (w *recordingWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	for _, b := range mb {
++		w.sent = append(w.sent, *b.UDP)
++	}
++	buf.ReleaseMulti(mb)
++	return nil
++}
++
++func datagram(to net.Destination) *buf.Buffer {
++	b := buf.New()
++	b.WriteString("x")
++	b.UDP = &to
++	return b
++}
++
++// A re-pointed QUIC flow: its datagrams for the app's address go to the home address, any other
++// destination is left as it is.
++func TestHomePacketWriterMovesOnlyTheAppsAddress(t *testing.T) {
++	app := net.UDPDestination(net.ParseAddress("43.175.44.34"), 443)
++	home := net.UDPDestination(net.ParseAddress("101.1.2.3"), 443)
++	otherPort := net.UDPDestination(net.ParseAddress("43.175.44.34"), 8443)
++	other := net.UDPDestination(net.ParseAddress("43.175.44.35"), 443)
++	rec := &recordingWriter{}
++	w := &homePacketWriter{Writer: rec, from: app, to: home}
++	if err := w.WriteMultiBuffer(buf.MultiBuffer{datagram(app), datagram(otherPort), datagram(other), datagram(app)}); err != nil {
++		t.Fatal(err)
++	}
++	want := []net.Destination{home, otherPort, other, home}
++	if len(rec.sent) != len(want) {
++		t.Fatalf("sent %v, want %v", rec.sent, want)
++	}
++	for i := range want {
++		if rec.sent[i] != want[i] {
++			t.Errorf("datagram %d went to %v, want %v", i, rec.sent[i], want[i])
++		}
++	}
++}
++
++// The replies of the home address are given back as from the address the app sent to, so the app's
++// QUIC connection keeps its peer. A real UDP socket stands in for the home server.
++func TestRepointedFlowRepliesComeFromTheAppsAddress(t *testing.T) {
++	server, err := gonet.ListenUDP("udp4", &gonet.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	client, err := gonet.ListenUDP("udp4", &gonet.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	homeAddr := server.LocalAddr().(*gonet.UDPAddr)
++	conn := &net.PacketConnWrapper{PacketConn: client, Dest: homeAddr}
++	app := net.UDPDestination(net.ParseAddress("43.175.44.34"), net.Port(homeAddr.Port))
++	home := net.UDPDestination(net.IPAddress(homeAddr.IP), net.Port(homeAddr.Port))
++
++	// Sent through the writer as the flow's app addressed it: it reaches the home server.
++	writer := &homePacketWriter{Writer: NewPacketWriter(conn, &Handler{}, nil, net.UDPDestination(nil, 0), home, nil), from: app, to: home}
++	if err := writer.WriteMultiBuffer(buf.MultiBuffer{datagram(app)}); err != nil {
++		t.Fatal(err)
++	}
++	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
++	b := make([]byte, 16)
++	_, from, err := server.ReadFromUDP(b)
++	if err != nil {
++		t.Fatalf("the home server got nothing: %v", err)
++	}
++	if _, err := server.WriteToUDP([]byte("reply"), from); err != nil {
++		t.Fatal(err)
++	}
++
++	reader := NewPacketReader(conn, &Handler{}, nil, net.UDPDestination(nil, 0), app)
++	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
++	mb, err := reader.ReadMultiBuffer()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer buf.ReleaseMulti(mb)
++	if got := mb[0].UDP; got == nil || *got != app {
++		t.Fatalf("reply given back as from %v, want %v", got, app)
++	}
++	if string(mb[0].Bytes()) != "reply" {
++		t.Fatalf("reply %q", mb[0].Bytes())
 +	}
 +}
 --- /dev/null

@@ -301,7 +301,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
+	// appTarget is where the app sent a UDP flow that homeTarget moved: its datagrams for that address go
+	// to the home address, and the home address's replies are given back as from appTarget.
+	appTarget := destination
 	destination = homeTarget(ctx, h.home, h.homeResolver, ob, destination)
+	if destination.Network != net.Network_UDP || destination.Address == appTarget.Address {
+		appTarget = destination
+	}
 
 	input := link.Reader
 	output := link.Writer
@@ -423,6 +429,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+			if appTarget != destination {
+				writer = &homePacketWriter{Writer: writer, from: appTarget, to: destination}
+			}
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -457,7 +466,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if destination.Network == net.Network_TCP {
 			reader = buf.NewReader(conn)
 		} else {
-			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+			// Replies from the dialed address are given back as from appTarget (InitChangedAddr to
+			// InitUnchangedAddr), the address a re-pointed flow's app sent to.
+			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, appTarget)
 		}
 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)

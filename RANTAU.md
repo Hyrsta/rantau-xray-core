@@ -2,9 +2,12 @@
 
 This is the source of Xray-core [v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31) (commit
 `a4a3dff5b20c2faae567b742c172c7b95e75c083`, Go module version
-`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.12` supplies the
-exact source built into the Rantau VPN apps whose licence notices name it (Android, macOS and Windows 2.2.27
-and later), until a newer tag. It differs from `.11` only in the Chinese sites at home option described below.
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`) used by Rantau VPN. Tag `v26.10.31-rantau.13` supplies the
+exact source built into the Rantau VPN apps whose licence notices name it (Android, macOS and Windows 2.2.29
+and later), until a newer tag. It differs from `.12` only in the Chinese sites at home option now also taking
+QUIC (HTTP/3), described below.
+`v26.10.31-rantau.12` supplies Android and macOS 2.2.27 and Windows 2.2.27 and 2.2.28, up to the first releases
+naming `.13`. It differs from `.11` only in the Chinese sites at home option described below.
 `v26.10.31-rantau.11` supplies Android, macOS and Windows 2.2.18 up to the first releases naming `.12`.
 It differs from `.10` only in the fewer wake-ups described below.
 `v26.10.31-rantau.10` supplies the releases from 13 November 2026 that name it, up to the first ones naming
@@ -37,13 +40,16 @@ Nothing is left out: since v26.9.30 Xray no longer uses the GPL-licensed
 included as they are.
 
 - **Chinese sites at home** (`proxy/freedom/mainland_sites.go`, opt-in per instance with
-  `freedom.WithMainlandSites`). A TCP connection that freedom carries with a sniffed name (TLS or HTTP) to a
-  public IPv4 address outside the instance's home list is connected at the first home IPv4 address the
-  instance's own resolver gives for that name, on the same port. Rantau's Smart mode routes Chinese sites
-  directly by name; an app or browser that looked the name up itself through the tunnel got the site's
-  servers abroad, and the direct connection then crossed the border. UDP, IPv6, local and reserved
-  addresses, home addresses, connections without a name and names whose answer has no home address are
-  dialed as before. Instances that do not opt in are unchanged.
+  `freedom.WithMainlandSites`). A TCP connection that freedom carries with a sniffed name (TLS or HTTP), or
+  (since `.13`) a UDP flow with a sniffed QUIC name, to a public IPv4 address outside the instance's home list
+  is connected at the first home IPv4 address the instance's own resolver gives for that name, on the same
+  port. A moved QUIC flow's datagrams for the app's address go to the home address (`homePacketWriter`, that
+  address only), and its replies are given back as from the app's address (`PacketReader`), so the app's QUIC
+  connection keeps its peer. Rantau's Smart mode routes Chinese sites directly by name; an app or browser that
+  looked the name up itself through the tunnel got the site's servers abroad, and the direct connection then
+  crossed the border. Other UDP, IPv6, local and reserved addresses, home addresses, connections without a
+  name and names whose answer has no home address are dialed as before. Instances that do not opt in are
+  unchanged.
 - **Fewer wake-ups** (same work, less waking while a tunnel is up). The two reserve connections of one
   refill share one random lifetime, so they close together (`proxy/vless/outbound/preconnect.go`). A TCP
   window the system keeps closed is probed after one second, then twice as seldom up to every eight seconds,
