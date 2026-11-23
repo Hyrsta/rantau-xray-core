@@ -1302,6 +1302,239 @@
 +		t.Fatal("a blocked UDP flow opened after the close kept waiting")
 +	}
 +}
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -23,6 +23,7 @@
+ 	"github.com/xtls/xray-core/common/task"
+ 	"github.com/xtls/xray-core/common/utils"
+ 	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/stats"
+ 	"github.com/xtls/xray-core/proxy"
+@@ -61,6 +62,14 @@
+ 			return h.Init(config.(*Config), pm)
+ 		}); err != nil {
+ 			return nil, err
++		}
++		if home := mainlandSitesFrom(ctx); home != nil {
++			if err := core.RequireFeatures(ctx, func(resolver dns.Client) error {
++				h.home, h.homeResolver = home, resolver
++				return nil
++			}); err != nil {
++				return nil, err
++			}
+ 		}
+ 		return h, nil
+ 	}))
+@@ -98,6 +107,9 @@
+ 	finalRules      []*FinalRule
+ 	resolveStrategy internet.DomainStrategy
+ 	usesDialerProxy bool
++
++	home         func(net.IP) bool // WithMainlandSites
++	homeResolver dns.Client
+ }
+ 
+ func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
+@@ -288,6 +300,8 @@
+ 			UDPOverride.Port = destination.Port
+ 		}
+ 	}
++
++	destination = homeTarget(ctx, h.home, h.homeResolver, ob, destination)
+ 
+ 	input := link.Reader
+ 	output := link.Writer
+--- /dev/null
++++ b/proxy/freedom/mainland_sites.go
+@@ -0,0 +1,75 @@
++package freedom
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/features/dns"
++)
++
++type mainlandSitesKey struct{}
++
++// WithMainlandSites makes the freedom outbounds of an instance built with this context connect a site
++// to its address at home when the app picked one abroad. The case: a TCP connection whose sniffed name
++// (TLS or HTTP, read by routeOnly sniffing) was routed to freedom, to a public IPv4 address for which
++// home is false. The instance's own resolver is asked for the name, and the first IPv4 address of its
++// answer for which home is true replaces the app's address. The app gets the same site from a server
++// nearby: a browser that looks names up over its own DNS over HTTPS through a proxy, for example, is
++// given a Chinese site's overseas servers, and a direct connection to those from inside China crosses
++// the border (the page took 4 to 8 s instead of 0.2 s, 2026-11-23).
++//
++// Everything else is dialed as before: UDP, IPv6, local and reserved addresses, addresses for which home
++// is true, connections without a sniffed name, and names whose answer has no home address or fails.
++// Other users of this Xray copy keep normal behavior unless they opt in.
++func WithMainlandSites(ctx context.Context, home func(net.IP) bool) context.Context {
++	return context.WithValue(ctx, mainlandSitesKey{}, home)
++}
++
++func mainlandSitesFrom(ctx context.Context) func(net.IP) bool {
++	home, _ := ctx.Value(mainlandSitesKey{}).(func(net.IP) bool)
++	return home
++}
++
++// cgnat is 100.64.0.0/10, shared address space: a carrier's or a campus's own network, like the
++// private ranges.
++var cgnat = net.IPNet{IP: net.IP{100, 64, 0, 0}, Mask: net.CIDRMask(10, 32)}
++
++// public reports an IPv4 address on the internet, not a local, reserved or multicast one.
++func public(ip net.IP) bool {
++	return !(ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() ||
++		ip.IsUnspecified() || cgnat.Contains(ip) || ip[0] == 0 || ip[0] >= 240)
++}
++
++// nameProtocols are the TCP sniffers whose name says which site the connection is for.
++var nameProtocols = map[string]bool{"tls": true, "http1": true, "http2": true}
++
++// homeTarget is the destination to dial: the target, or the same port at the name's home address (see
++// WithMainlandSites).
++func homeTarget(ctx context.Context, home func(net.IP) bool, resolver dns.Client, ob *session.Outbound, target net.Destination) net.Destination {
++	if home == nil || resolver == nil || target.Network != net.Network_TCP || target.Address == nil || !target.Address.Family().IsIPv4() {
++		return target
++	}
++	if ip := target.Address.IP().To4(); ip == nil || !public(ip) || home(ip) {
++		return target
++	}
++	name := ob.RouteTarget.Address
++	if name == nil || !name.Family().IsDomain() {
++		return target
++	}
++	if content := session.ContentFromContext(ctx); content == nil || !nameProtocols[content.Protocol] {
++		return target
++	}
++	ips, _, err := resolver.LookupIP(name.Domain(), dns.IPOption{IPv4Enable: true})
++	if err != nil {
++		return target
++	}
++	for _, ip := range ips {
++		if ip4 := ip.To4(); ip4 != nil && public(ip4) && home(ip4) {
++			errors.LogInfo(ctx, "connecting ", name.Domain(), " at home ", ip4, " instead of ", target.Address)
++			return net.Destination{Network: net.Network_TCP, Address: net.IPAddress(ip4), Port: target.Port}
++		}
++	}
++	return target
++}
+--- /dev/null
++++ b/proxy/freedom/mainland_sites_test.go
+@@ -0,0 +1,108 @@
++package freedom
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/features/dns"
++)
++
++// fakeResolver answers every name with the same addresses (or error) and counts lookups.
++type fakeResolver struct {
++	ips     []net.IP
++	err     error
++	lookups int
++	asked   string
++	option  dns.IPOption
++}
++
++func (*fakeResolver) Type() interface{} { return dns.ClientType() }
++func (*fakeResolver) Start() error      { return nil }
++func (*fakeResolver) Close() error      { return nil }
++func (r *fakeResolver) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
++	r.lookups++
++	r.asked, r.option = domain, option
++	return r.ips, 60, r.err
++}
++
++// home in these tests: 101.0.0.0/8 stands for the mainland.
++func testHome(ip net.IP) bool { return ip.To4() != nil && ip.To4()[0] == 101 }
++
++func sniffed(protocol, name string, target net.Destination) (context.Context, *session.Outbound) {
++	ctx := session.ContextWithContent(context.Background(), &session.Content{Protocol: protocol})
++	ob := &session.Outbound{Target: target}
++	if name != "" {
++		ob.RouteTarget = net.Destination{Network: target.Network, Address: net.DomainAddress(name), Port: target.Port}
++	}
++	return ctx, ob
++}
++
++func TestHomeTargetMovesASiteAbroadHome(t *testing.T) {
++	for _, protocol := range []string{"tls", "http1", "http2"} {
++		resolver := &fakeResolver{ips: []net.IP{net.ParseIP("43.175.44.34"), net.ParseIP("101.1.2.3"), net.ParseIP("101.1.2.4")}}
++		target := net.TCPDestination(net.ParseAddress("43.175.44.34"), 443)
++		ctx, ob := sniffed(protocol, "y.qq.com", target)
++		got := homeTarget(ctx, testHome, resolver, ob, target)
++		want := net.TCPDestination(net.ParseAddress("101.1.2.3"), 443)
++		if got != want {
++			t.Errorf("%s: got %v, want %v", protocol, got, want)
++		}
++		if resolver.asked != "y.qq.com" || !resolver.option.IPv4Enable || resolver.option.IPv6Enable {
++			t.Errorf("%s: asked %q with %+v, want y.qq.com, IPv4 only", protocol, resolver.asked, resolver.option)
++		}
++	}
++}
++
++func TestHomeTargetLeavesEverythingElse(t *testing.T) {
++	abroad := net.TCPDestination(net.ParseAddress("43.175.44.34"), 443)
++	cases := []struct {
++		name     string
++		protocol string
++		site     string
++		target   net.Destination
++		resolver *fakeResolver
++		home     func(net.IP) bool
++		asks     bool
++	}{
++		{"already home", "tls", "y.qq.com", net.TCPDestination(net.ParseAddress("101.9.9.9"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"UDP (QUIC)", "quic", "y.qq.com", net.UDPDestination(net.ParseAddress("43.175.44.34"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"no sniffed name", "tls", "", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"not sniffed", "", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"other protocol", "bittorrent", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"private network", "tls", "intranet.example.cn", net.TCPDestination(net.ParseAddress("10.1.2.3"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"shared address space", "tls", "portal.example.cn", net.TCPDestination(net.ParseAddress("100.70.1.1"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"link local", "http1", "router.example.cn", net.TCPDestination(net.ParseAddress("169.254.1.1"), 80), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"loopback", "tls", "y.qq.com", net.TCPDestination(net.ParseAddress("127.0.0.1"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"IPv6", "tls", "y.qq.com", net.TCPDestination(net.ParseAddress("2402:4e00::1"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"domain target", "tls", "y.qq.com", net.TCPDestination(net.DomainAddress("y.qq.com"), 443), &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, testHome, false},
++		{"not opted in", "tls", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}}, nil, false},
++		{"answer abroad too", "tls", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("43.175.44.35")}}, testHome, true},
++		{"answer local", "tls", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("192.168.1.1")}}, func(ip net.IP) bool { return testHome(ip) || ip.IsPrivate() }, true},
++		{"empty answer", "tls", "y.qq.com", abroad, &fakeResolver{}, testHome, true},
++		{"lookup failed", "tls", "y.qq.com", abroad, &fakeResolver{ips: []net.IP{net.ParseIP("101.1.2.3")}, err: errors.New("timeout")}, testHome, true},
++	}
++	for _, c := range cases {
++		ctx, ob := sniffed(c.protocol, c.site, c.target)
++		if c.protocol == "" {
++			ctx = context.Background()
++		}
++		if got := homeTarget(ctx, c.home, c.resolver, ob, c.target); got != c.target {
++			t.Errorf("%s: got %v, want %v unchanged", c.name, got, c.target)
++		}
++		if asked := c.resolver.lookups > 0; asked != c.asks {
++			t.Errorf("%s: looked up %d times, want lookup %v", c.name, c.resolver.lookups, c.asks)
++		}
++	}
++}
++
++func TestMainlandSitesOptIn(t *testing.T) {
++	if mainlandSitesFrom(context.Background()) != nil {
++		t.Fatal("an instance that did not opt in moves connections")
++	}
++	if mainlandSitesFrom(WithMainlandSites(context.Background(), testHome)) == nil {
++		t.Fatal("the opt-in was lost")
++	}
++}
 --- /dev/null
 +++ b/proxy/hysteria/listen_context_test.go
 @@ -0,0 +1,21 @@

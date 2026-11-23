@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
@@ -62,6 +63,14 @@ func init() {
 		}); err != nil {
 			return nil, err
 		}
+		if home := mainlandSitesFrom(ctx); home != nil {
+			if err := core.RequireFeatures(ctx, func(resolver dns.Client) error {
+				h.home, h.homeResolver = home, resolver
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
 		return h, nil
 	}))
 
@@ -98,6 +107,9 @@ type Handler struct {
 	finalRules      []*FinalRule
 	resolveStrategy internet.DomainStrategy
 	usesDialerProxy bool
+
+	home         func(net.IP) bool // WithMainlandSites
+	homeResolver dns.Client
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -288,6 +300,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			UDPOverride.Port = destination.Port
 		}
 	}
+
+	destination = homeTarget(ctx, h.home, h.homeResolver, ob, destination)
 
 	input := link.Reader
 	output := link.Writer
